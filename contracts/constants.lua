@@ -1,0 +1,29 @@
+--- Orderbook-only snapshot from Rune Realm commit
+--- e1dc6602f7603d6ca86f67ad1d30bd6fc5979630.
+--- Keep this file aligned with provenance/orderbook-settings.json.
+local C = {
+  ECONOMY = {
+    orderbook = {
+      maxPerAccount = 20,
+      maxGlobal = 2000,
+      minValue = 10,
+      maxUnitPrice = 1000000,
+      maxQuantity = 1000000,
+      creationCost = 1,
+      feeBps = 200,
+      expiry = 2592000000,
+      historyLimit = 500,
+      tapeLimit = 96,
+      minExpiry = 300000,
+      bandBps = 5000,
+      deskSweepMax = 100,
+      candleDays = 30,
+      intraday = {
+        { seconds = 60, bars = 180 },
+        { seconds = 300, bars = 288 },
+      },
+    },
+  },
+}
+
+return C

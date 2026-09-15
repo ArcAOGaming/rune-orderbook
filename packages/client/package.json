@@ -1,0 +1,10 @@
+{
+  "name": "@runerealm/orderbook-client",
+  "private": true,
+  "version": "0.0.0-phase.1",
+  "type": "module",
+  "exports": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "rune-orderbook",
+  "private": true,
+  "version": "0.0.0-phase.1",
+  "type": "module",
+  "workspaces": ["app", "packages/*"],
+  "scripts": {
+    "dev": "npm run dev -w @runerealm/orderbook-app",
+    "build": "npm run typecheck -w @runerealm/orderbook-client && npm run typecheck -w @runerealm/orderbook-ui && npm run build -w @runerealm/orderbook-app",
+    "test": "node --test test/*.test.mjs && npm run build",
+    "test:contract": "bash scripts/test-contract.sh"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}

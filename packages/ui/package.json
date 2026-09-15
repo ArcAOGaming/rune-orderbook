@@ -1,0 +1,20 @@
+{
+  "name": "@runerealm/orderbook-ui",
+  "private": true,
+  "version": "0.0.0-phase.1",
+  "type": "module",
+  "exports": "./src/index.tsx",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@runerealm/orderbook-client": "0.0.0-phase.1"
+  },
+  "peerDependencies": {
+    "react": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.18",
+    "react": "^18.3.1"
+  }
+}
