@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "sourceRepositoryAtSplit": "ArcAOGaming/RuneRealm-UI",
+  "canonicalSourceRepository": "ArcAOGaming/rune-super-repo",
+  "sourceCommit": "e1dc6602f7603d6ca86f67ad1d30bd6fc5979630",
+  "filteredCheckpointCommit": "6cd6f17e0edef600b12c630454b0894e4354fee3",
+  "filterPaths": [
+    "backend/native/orderbook.lua",
+    "backend/native/venue.lua",
+    "backend/native/venue_test.lua",
+    "backend/native/run-venue-test.sh",
+    "backend/native/run-local-venue-test.mjs",
+    "backend/native/deploy-venue.mjs",
+    "backend/native/json.lua",
+    "backend/native/jsonenc.lua",
+    "backend/native/constants.lua",
+    "src/lib/venue.ts",
+    "src/lib/marketplace-config.ts",
+    "src/lib/market-chart-lab.ts",
+    "src/screens/Marketplace.tsx",
+    "src/ui/marketVenues.tsx",
+    "src/index.css",
+    "ORDERBOOK.md",
+    "MARKETPLACE.md",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "README.md",
+    ".gitignore",
+    ".npmrc"
+  ]
+}

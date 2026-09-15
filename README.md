@@ -24,6 +24,9 @@ only after `rune-ao` has a product-neutral release.
 - `provenance/` — the exact source commit and orderbook settings used at the
   split. `test/constants-drift.test.mjs` keeps the Lua snapshot aligned.
 
+The complete history-filter recipe and rewritten checkpoint parent are recorded
+in `split-provenance.json`.
+
 Run the complete Lua suite against a free public Luerl device with
 `npm run test:contract`. No wallet is used and no process is deployed.
 That networked suite is manual only; pull requests run the deterministic
