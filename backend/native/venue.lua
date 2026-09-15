@@ -453,6 +453,7 @@ local function newBook()
     orders = {}, orderSeq = 0, orderHistory = {},
     fills = {}, fillSeq = 0,
     marketDaily = {},
+    marketIntraday = {},
     actionReceipts = {}, actionReceiptOrder = {},
     rejected = {},
     pools = {},
@@ -465,6 +466,7 @@ local function ensureBook()
   for key, value in pairs(newBook()) do
     if Book[key] == nil then Book[key] = value end
   end
+  OrderBook.normaliseMarketIntraday(Book)
   OrderBook.ensureIndex(Book)
   return Book
 end
@@ -525,6 +527,12 @@ end
 ---                      order against a full receipt map makes
 ---                      `rememberAction`'s sweep break on its first iteration
 ---                      forever, and the receipts then grow without bound.
+---   marketIntraday,
+---   marketIntradayVersion
+---                      already published once under `venuecandles`. A cold
+---                      restore reads that key back and canonicalises it; a
+---                      second copy inside `venuebookstate` would make every
+---                      message carry the largest chart payload twice.
 ---
 --- KEPT, and each for a reason:
 ---   fills              THE ONE THAT DIFFERS FROM THE GAME. `economy.lua` can
@@ -548,12 +556,15 @@ end
 local function bookExport()
   local dropped = {
     bookIndex = true, orderHistory = true, rejected = true,
-    actionReceiptOrder = true,
+    actionReceiptOrder = true, marketIntraday = true,
+    marketIntradayVersion = true,
   }
   local out = {}
   for key, value in pairs(ensureBook()) do
     if not dropped[key] then out[key] = value end
   end
+  out.receiptRows = OrderBook.exportReceiptRows(out.actionReceipts)
+  out.actionReceipts = nil
   return out
 end
 
@@ -571,8 +582,8 @@ local function rebuildReceiptOrder(book)
   local keys = {}
   for key in pairs(receipts) do keys[#keys + 1] = key end
   table.sort(keys, function(a, b)
-    local ta = int((receipts[a] or {}).timestamp, 0)
-    local tb = int((receipts[b] or {}).timestamp, 0)
+    local ta = OrderBook.receiptTimestamp(receipts[a])
+    local tb = OrderBook.receiptTimestamp(receipts[b])
     if ta ~= tb then return ta < tb end
     return a < b
   end)
@@ -638,6 +649,31 @@ local function rebuildAssetIndex()
   end
 end
 
+--- Rehydrate the internal flat candle arrays from their one published copy.
+--- The public key is grouped by market id; authoritative state is grouped by
+--- base asset because that is what the shared engine receives on a fill.
+--- `normaliseMarketIntraday` accepts the published tuple rows and converts the
+--- JSON string interval keys back to numeric flat arrays.
+local function restoreIntraday(base, book)
+  if type(book.marketIntraday) == "table" and next(book.marketIntraday) ~= nil then return end
+  local published = decodedTable(base and base.venuecandles)
+  if not published then return end
+  local restored = {}
+  for id, intervals in pairs(published) do
+    local market = type(book.markets) == "table" and book.markets[id] or nil
+    if market and type(market.base) == "string" and type(intervals) == "table" then
+      for seconds, rows in pairs(intervals) do
+        if type(rows) == "table" then
+          restored[seconds] = type(restored[seconds]) == "table" and restored[seconds] or {}
+          restored[seconds][market.base] = rows
+        end
+      end
+    end
+  end
+  book.marketIntraday = restored
+  book.marketIntradayVersion = nil
+end
+
 local function restoreOperationalState(base)
   local meta = decodedTable(base and base.venuecommit)
   if not meta then return end
@@ -663,8 +699,10 @@ local function restoreOperationalState(base)
      or int(Book.fillSeq, 0) < int(meta.fillSeq, 0) then
     local restored = decodedTable(base.venuebookstate)
     if restored then
-      Book = narrowNumbers(restored)
+      Book = OrderBook.restoreReceiptRows(narrowNumbers(restored))
       OrderBook.normaliseMarketDaily(Book)
+      restoreIntraday(base, Book)
+      OrderBook.normaliseMarketIntraday(Book)
       ensureBook()
       rebuildReceiptOrder(Book)
     end
@@ -753,6 +791,19 @@ local function bookView(timestamp)
       band = band,
       candles = OrderBook.candleView(Book, timestamp, market.base),
     }
+  end
+  return markets
+end
+
+--- Durable intraday bars live apart from `venuebook`: the depth/touch moves
+--- on every order while chart history moves only on fills, and the client can
+--- fetch either answer independently. Market ids are written once around both
+--- interval arrays; each row is the eight-integer tuple documented in
+--- `OrderBook.intradayView`.
+local function candleView(timestamp)
+  local markets = {}
+  for id, market in pairs(Book.markets) do
+    markets[id] = OrderBook.intradayView(Book, timestamp, market.base)
   end
   return markets
 end
@@ -1479,6 +1530,8 @@ function compute(base, req)
   result.assets = encode(assetView())
   result.markets = encode(marketView())
   result.venuebook = encode(bookView(timestamp))
+  result.venuecandles = encode(candleView(timestamp))
+  result.venuetape = encode(OrderBook.tapeView(Book))
   result.supply = encode(supplyView())
   result.paused = Emergency.paused and "1" or "0"
 

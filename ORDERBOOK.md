@@ -1,6 +1,13 @@
 # The order book: what it is, what it is missing, and how it leaves
 
 Companion to [ECONOMY.md](ECONOMY.md) and [MARKETPLACE.md](MARKETPLACE.md).
+
+Current status (2026-09-09): player-to-player goods trading is served only by
+the dedicated internal `venue.lua` process. `game.lua` retains the finite NPC
+shop and explicit `Economy.Order.*` compatibility refusals; `Admin.Load`
+cancels migrated legacy authority orders through the normal escrow-return path
+before retiring that old book. The historical sections below explain the
+engine now used by the venue.
 This one is only about the **Gold order book** — `EconomyEngine` in
 `backend/native/economy.lua`, the `Economy.Order.*` verbs in `game.lua`, and
 the Trading Floor in `src/screens/Marketplace.tsx`.
@@ -1122,3 +1129,47 @@ redeploy (`orderbook.lua`, `ACCOUNT_FILL_RING`), so cutting it shortens how far
 back a player's own history survives a deploy, and it anchors the price band's
 median on a venue with no desk. Cutting it to ~150 would save ~100 KB and is
 worth its own decision — it is not part of this change.
+
+## 15. Built: bounded intraday OHLCV (2026-09-11)
+
+Daily candles are not enough for a trading screen, and the 500-fill ring is not
+a time series: one busy pair can push every other pair off it. The venue now
+publishes durable intraday bars under the separate `venuecandles` key:
+
+```json
+{
+  "rune/relic": {
+    "60": [[bucket, open, high, low, close, baseVolume, quoteVolume, fills]],
+    "300": [[bucket, open, high, low, close, baseVolume, quoteVolume, fills]]
+  }
+}
+```
+
+- `bucket` is the interval start in epoch **seconds**. All eight values are raw
+  integers; no timestamp or amount passes through a float.
+- `60` retains at most 180 one-minute bars (three hours), and `300` retains at
+  most 288 five-minute bars (twenty-four hours), per market. The caps live in
+  `C.ECONOMY.orderbook.intraday` and are applied when each fill is recorded.
+- Rows are oldest first. Empty wall-clock buckets are omitted rather than
+  inventing trades; the client may preserve or visually collapse those gaps.
+- The existing named daily candles in `venuebook[market].candles` remain the
+  longer-range view and keep their existing shape.
+
+Authoritative intraday state is not stored as one Lua table per bar. Each
+market/interval uses one flat scalar array in `Book.marketIntraday`, eight
+values per bar. At full capacity across the seven internal markets that avoids
+3,276 long-lived row tables. `intradayView` materialises the public tuples only
+long enough for `jsonenc.lua` to encode them.
+
+The bars are also published exactly once. `venuebookstate` deliberately omits
+`marketIntraday`; a cold slot restores it from `venuecandles`, converts JSON's
+string interval keys back to integers, flattens tuple rows, merges duplicate
+buckets defensively, and reapplies the caps. A deployment upgraded from the
+daily-only state has no `venuecandles`, so normalization reconstructs every bar
+it still can from the retained fill ring before accepting the next fill.
+
+Measured with the venue's actual `jsonenc.lua`, not an estimate: a synthetic
+fully occupied seven-market key is **121,454 bytes (118.6 KiB)**. Sparse books
+pay only for intervals that traded. That is material, but it is not duplicated
+inside the restore key; the requested 3-hour/24-hour chart windows are the one
+published copy.

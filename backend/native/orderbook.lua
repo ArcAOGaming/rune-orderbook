@@ -27,6 +27,8 @@ local M = {}
 
 local DAY = 24 * 3600 * 1000
 local BPS = 10000
+local INTRADAY_WIDTH = 8
+local INTRADAY_VERSION = 1
 
 --- Bumped whenever the derived index changes shape, so a process carrying an
 --- older one rebuilds instead of trusting it. See `bookIndex`.
@@ -794,6 +796,16 @@ local function appendBounded(list, row, limit)
   while #list > limit do table.remove(list, 1) end
 end
 
+local RECEIPT_CODES = {
+  ["order.place"] = "p", ["order.amend"] = "a",
+  ["order.cancel"] = "c", ["order.cancelAll"] = "x",
+  ["shop.trade"] = "s",
+}
+local RECEIPT_KINDS = {
+  p = "order.place", a = "order.amend", c = "order.cancel",
+  x = "order.cancelAll", s = "shop.trade",
+}
+
 local function replayedAction(state, account, actionId, kind)
   if actionId == nil or actionId == "" then return false, nil, nil end
   if type(actionId) ~= "string" or #actionId > 128 then
@@ -801,7 +813,15 @@ local function replayedAction(state, account, actionId, kind)
   end
   local key = tostring(account) .. ":" .. actionId
   local receipt = state.actionReceipts[key]
-  if receipt and receipt.kind ~= kind then
+  local receiptKind
+  if type(receipt) == "table" then
+    receiptKind = receipt.kind
+  elseif type(receipt) == "string" then
+    local split = string.find(receipt, ":", 1, true)
+    local code = split and string.sub(receipt, 1, split - 1) or receipt
+    receiptKind = RECEIPT_KINDS[code] or code
+  end
+  if receipt and receiptKind ~= kind then
     return nil, nil, "ActionId was already used for a different economy action"
   end
   return receipt ~= nil, key, nil
@@ -828,21 +848,107 @@ local RECEIPT_CEILING = 5000
 --- a quiet week does not pay for the whole week.
 local RECEIPT_SWEEP = 50
 
+--- A replay receipt is two scalars, so keep it as one scalar. The previous
+--- `{ kind = ..., timestamp = ... }` value allocated one permanent Lua table
+--- per action and repeated both JSON field names in the restore export. Luerl's
+--- collector is quadratic in live TABLES and essentially free in string bytes,
+--- making the table shape the expensive one even before publication size.
+local function receiptValue(kind, timestamp)
+  return (RECEIPT_CODES[kind] or tostring(kind)) .. ":" .. tostring(int(timestamp, 0))
+end
+
+local function receiptTimestamp(receipt)
+  if type(receipt) == "table" then return int(receipt.timestamp, 0) end
+  if type(receipt) ~= "string" then return 0 end
+  local split = string.find(receipt, ":", 1, true)
+  return split and int(string.sub(receipt, split + 1), 0) or 0
+end
+
+local function receiptCode(receipt)
+  if type(receipt) == "table" then return RECEIPT_CODES[receipt.kind] or tostring(receipt.kind) end
+  if type(receipt) ~= "string" then return "" end
+  local split = string.find(receipt, ":", 1, true)
+  return split and string.sub(receipt, 1, split - 1) or receipt
+end
+
+--- Compact the restore-only receipt map by grouping the address once and using
+--- positional rows `[actionId, kindCode, timestamp]`. The hot lookup remains a
+--- flat map; only the cold export pays to transform it.
+local function exportReceiptRows(receipts)
+  local groups = {}
+  for key, receipt in pairs(type(receipts) == "table" and receipts or {}) do
+    local account, actionId = "", tostring(key)
+    if #actionId > 44 and string.sub(actionId, 44, 44) == ":" then
+      account, actionId = string.sub(actionId, 1, 43), string.sub(actionId, 45)
+    end
+    local rows = groups[account]
+    if not rows then rows = {}; groups[account] = rows end
+    rows[#rows + 1] = { actionId, receiptCode(receipt), receiptTimestamp(receipt) }
+  end
+  for _, rows in pairs(groups) do
+    table.sort(rows, function(a, b)
+      if a[3] ~= b[3] then return a[3] < b[3] end
+      return a[1] < b[1]
+    end)
+  end
+  return groups
+end
+
+local function restoreReceiptRows(state)
+  if type(state) ~= "table" or type(state.receiptRows) ~= "table" then return state end
+  state.actionReceipts = type(state.actionReceipts) == "table" and state.actionReceipts or {}
+  for account, rows in pairs(state.receiptRows) do
+    for _, row in ipairs(type(rows) == "table" and rows or {}) do
+      if type(row) == "table" and type(row[1]) == "string" then
+        local key = account ~= "" and (tostring(account) .. ":" .. row[1]) or row[1]
+        state.actionReceipts[key] = tostring(row[2] or "") .. ":" .. tostring(int(row[3], 0))
+      end
+    end
+  end
+  state.receiptRows = nil
+  return state
+end
+
 local function rememberAction(state, key, kind, timestamp)
   if not key then return end
-  state.actionReceipts[key] = { kind = kind, timestamp = timestamp }
+  state.actionReceipts[key] = receiptValue(kind, timestamp)
   state.actionReceiptOrder[#state.actionReceiptOrder + 1] = key
   local swept = 0
   while swept < RECEIPT_SWEEP and #state.actionReceiptOrder > 0 do
     local oldest = state.actionReceiptOrder[1]
     local receipt = state.actionReceipts[oldest]
     local expired = receipt == nil
-      or (int(timestamp, 0) - int(receipt.timestamp, 0)) >= RECEIPT_TTL
+      or (int(timestamp, 0) - receiptTimestamp(receipt)) >= RECEIPT_TTL
     if not expired and #state.actionReceiptOrder <= RECEIPT_CEILING then break end
     table.remove(state.actionReceiptOrder, 1)
     state.actionReceipts[oldest] = nil
     swept = swept + 1
   end
+end
+
+--- The public tape: recent trades with every private or derivable field gone.
+--- Rows are `[seconds, price, quantity, takerBought]`, grouped by market id.
+--- The cap is venue-wide, so adding markets never multiplies this key's size.
+local function tapeView(state, limit)
+  local out = {}
+  local fills = type(state) == "table" and state.fills or {}
+  local keep = math.max(1, int(limit, C.ECONOMY.orderbook.tapeLimit or 96))
+  local first = math.max(1, #fills - keep + 1)
+  for i = first, #fills do
+    local fill = fills[i]
+    if type(fill) == "table" then
+      local market = fill.market or (tostring(fill.item) .. "/gold")
+      local rows = out[market]
+      if not rows then rows = {}; out[market] = rows end
+      rows[#rows + 1] = {
+        int(fill.filledAt, 0) // 1000,
+        int(fill.price, 0),
+        int(fill.quantity, 0),
+        takerSideOf(fill) == "buy" and 1 or 0,
+      }
+    end
+  end
+  return out
 end
 
 --- What an order is priced IN.
@@ -979,6 +1085,237 @@ local function marketDay(state, timestamp, item)
     if int(key, day) < day - 35 then state.marketDaily[key] = nil end
   end
   return asset
+end
+
+--- The configured intraday windows, narrowed once per use so neither a JSON
+--- restore nor a future config edit can put floats into contract state.
+local function intradaySpecs()
+  local specs = {}
+  local configured = C.ECONOMY.orderbook.intraday or {}
+  for _, row in ipairs(configured) do
+    local seconds = math.max(1, int(row.seconds, 0))
+    local bars = math.max(1, int(row.bars, 0))
+    if seconds > 0 and bars > 0 then
+      specs[#specs + 1] = { seconds = seconds, bars = bars }
+    end
+  end
+  table.sort(specs, function(a, b) return a.seconds < b.seconds end)
+  return specs
+end
+
+--- Intraday rows are FLAT in authoritative state:
+---
+---   bucketSeconds, open, high, low, close, baseVolume, quoteVolume, fills
+---
+--- Repeating a Lua table around every candle would retain 3,276 extra tables
+--- on the seven-market venue at the configured caps. Luerl's collector is
+--- quadratic in live tables; eight scalars in one flat array keep the exact
+--- same information without turning chart history into a checkpoint tax. The
+--- published view materialises tuples only long enough to encode them.
+local function appendFlatBar(rows, bucket, price, quantity, gross)
+  local at = #rows + 1
+  rows[at] = bucket
+  rows[at + 1] = price
+  rows[at + 2] = price
+  rows[at + 3] = price
+  rows[at + 4] = price
+  rows[at + 5] = quantity
+  rows[at + 6] = gross
+  rows[at + 7] = 1
+end
+
+local function insertFlatRow(rows, at, row)
+  for slot = #rows, at, -1 do rows[slot + INTRADAY_WIDTH] = rows[slot] end
+  for offset = 0, INTRADAY_WIDTH - 1 do rows[at + offset] = int(row[offset + 1], 0) end
+end
+
+local function mergeFlatBar(rows, at, price, quantity, gross, replaceClose)
+  rows[at + 2] = math.max(int(rows[at + 2], price), price)
+  rows[at + 3] = math.min(int(rows[at + 3], price), price)
+  if replaceClose then rows[at + 4] = price end
+  rows[at + 5] = int(rows[at + 5], 0) + quantity
+  rows[at + 6] = int(rows[at + 6], 0) + gross
+  rows[at + 7] = int(rows[at + 7], 0) + 1
+end
+
+local function dropFlatPrefix(rows, values)
+  values = math.min(#rows, math.max(0, int(values, 0)))
+  if values <= 0 then return end
+  local size = #rows
+  for at = 1, size - values do rows[at] = rows[at + values] end
+  for at = size, size - values + 1, -1 do rows[at] = nil end
+end
+
+local function pruneFlatBars(rows, seconds, limit, newestBucket)
+  local oldest = newestBucket - (limit - 1) * seconds
+  local drop = 0
+  while drop < #rows and int(rows[drop + 1], oldest) < oldest do
+    drop = drop + INTRADAY_WIDTH
+  end
+  local count = (#rows - drop) // INTRADAY_WIDTH
+  if count > limit then drop = drop + (count - limit) * INTRADAY_WIDTH end
+  dropFlatPrefix(rows, drop)
+end
+
+--- Fold one fill into one flat interval. Runtime fills are monotonic and take
+--- the append/last-row path. The backwards scan exists for restored fixtures
+--- and defensive out-of-order input; an older fill may widen and add volume to
+--- a historical bar, but may not replace the close established by a later one.
+local function recordFlatInterval(rows, seconds, limit, timestamp, price, quantity, gross)
+  local bucket = ((int(timestamp, 0) // 1000) // seconds) * seconds
+  local last = #rows - INTRADAY_WIDTH + 1
+  if last < 1 or bucket > int(rows[last], -1) then
+    appendFlatBar(rows, bucket, price, quantity, gross)
+  elseif bucket == int(rows[last], -1) then
+    mergeFlatBar(rows, last, price, quantity, gross, true)
+  else
+    local at = last - INTRADAY_WIDTH
+    while at >= 1 and int(rows[at], -1) > bucket do at = at - INTRADAY_WIDTH end
+    if at >= 1 and int(rows[at], -1) == bucket then
+      mergeFlatBar(rows, at, price, quantity, gross, false)
+    else
+      local insertAt = at + INTRADAY_WIDTH
+      insertFlatRow(rows, insertAt,
+        { bucket, price, price, price, price, quantity, gross, 1 })
+    end
+  end
+  local newestAt = #rows - INTRADAY_WIDTH + 1
+  local newest = newestAt >= 1 and int(rows[newestAt], bucket) or bucket
+  pruneFlatBars(rows, seconds, limit, newest)
+end
+
+local function recordIntradayRaw(state, timestamp, item, price, quantity, gross)
+  state.marketIntraday = type(state.marketIntraday) == "table" and state.marketIntraday or {}
+  for _, spec in ipairs(intradaySpecs()) do
+    local interval = state.marketIntraday[spec.seconds]
+    if type(interval) ~= "table" then
+      interval = {}
+      state.marketIntraday[spec.seconds] = interval
+    end
+    local rows = interval[item]
+    if type(rows) ~= "table" then rows = {}; interval[item] = rows end
+    recordFlatInterval(rows, spec.seconds, spec.bars, timestamp,
+      int(price, 0), int(quantity, 0), int(gross, 0))
+  end
+end
+
+local function intradayReady(state, specs)
+  if int(state.marketIntradayVersion, 0) ~= INTRADAY_VERSION
+     or type(state.marketIntraday) ~= "table" then return false end
+  for _, spec in ipairs(specs) do
+    if type(state.marketIntraday[spec.seconds]) ~= "table"
+       or state.marketIntraday[tostring(spec.seconds)] ~= nil then return false end
+    for _, rows in pairs(state.marketIntraday[spec.seconds]) do
+      if type(rows) ~= "table" or type(rows[1]) == "table"
+         or (#rows % INTRADAY_WIDTH) ~= 0 then return false end
+    end
+  end
+  return true
+end
+
+--- Canonicalise the intraday state after a JSON/cold restore.
+---
+--- JSON object keys come back as strings, while live fills index intervals by
+--- integer seconds. Both spellings are folded into one numeric interval and
+--- duplicate buckets are merged before the hard cap is applied. A process
+--- upgraded from the daily-only shape has no intraday state at all; its
+--- retained fill ring is replayed once so the new chart starts with every
+--- recent trade the old process can still prove instead of an empty panel.
+local function normaliseMarketIntraday(state, backfill)
+  local specs = intradaySpecs()
+  if intradayReady(state, specs) then return state end
+  local source = type(state.marketIntraday) == "table" and state.marketIntraday or {}
+  local normalized = {}
+  local preserved = {}
+
+  local function mergeAggregate(target, row, seconds)
+    local bucket = (int(row[1], 0) // seconds) * seconds
+    local at = #target - INTRADAY_WIDTH + 1
+    while at >= 1 and int(target[at], -1) > bucket do at = at - INTRADAY_WIDTH end
+    if at >= 1 and int(target[at], -1) == bucket then
+      target[at + 2] = math.max(int(target[at + 2], 0), int(row[3], 0))
+      target[at + 3] = math.min(int(target[at + 3], int(row[4], 0)), int(row[4], 0))
+      target[at + 4] = int(row[5], 0)
+      target[at + 5] = int(target[at + 5], 0) + int(row[6], 0)
+      target[at + 6] = int(target[at + 6], 0) + int(row[7], 0)
+      target[at + 7] = int(target[at + 7], 0) + int(row[8], 0)
+    else
+      row[1] = bucket
+      insertFlatRow(target, at + INTRADAY_WIDTH, row)
+    end
+  end
+
+  local function foldRows(target, rows, seconds, limit)
+    if type(rows) ~= "table" then return end
+    if type(rows[1]) == "table" then
+      for _, row in ipairs(rows) do
+        if type(row) == "table" and #row >= INTRADAY_WIDTH then
+          mergeAggregate(target, row, seconds)
+        end
+      end
+    else
+      local size = #rows - (#rows % INTRADAY_WIDTH)
+      for at = 1, size, INTRADAY_WIDTH do
+        local row = {}
+        for offset = 0, INTRADAY_WIDTH - 1 do row[offset + 1] = rows[at + offset] end
+        mergeAggregate(target, row, seconds)
+      end
+    end
+    if #target > 0 then
+      local newest = int(target[#target - INTRADAY_WIDTH + 1], 0)
+      pruneFlatBars(target, seconds, limit, newest)
+    end
+  end
+
+  for _, spec in ipairs(specs) do
+    local targetInterval = {}
+    normalized[spec.seconds] = targetInterval
+    preserved[spec.seconds] = {}
+    local first, second = source[tostring(spec.seconds)], source[spec.seconds]
+    local function foldInterval(interval)
+      if type(interval) == "table" then
+        for item, rows in pairs(interval) do
+          local target = targetInterval[item]
+          if type(target) ~= "table" then target = {}; targetInterval[item] = target end
+          foldRows(target, rows, spec.seconds, spec.bars)
+        end
+      end
+    end
+    foldInterval(first)
+    if second ~= first then foldInterval(second) end
+    for item, rows in pairs(targetInterval) do
+      if #rows > 0 then preserved[spec.seconds][item] = true end
+    end
+  end
+
+  state.marketIntraday = normalized
+  if backfill ~= false then
+    for _, fill in ipairs(type(state.fills) == "table" and state.fills or {}) do
+      if type(fill) == "table" and type(fill.item) == "string" then
+        local price, quantity = int(fill.price, 0), int(fill.quantity, 0)
+        for _, spec in ipairs(specs) do
+          if not preserved[spec.seconds][fill.item] then
+            local interval = state.marketIntraday[spec.seconds]
+            local rows = interval[fill.item]
+            if type(rows) ~= "table" then rows = {}; interval[fill.item] = rows end
+            recordFlatInterval(rows, spec.seconds, spec.bars,
+              int(fill.filledAt, 0), price, quantity, price * quantity)
+          end
+        end
+      end
+    end
+  end
+  state.marketIntradayVersion = INTRADAY_VERSION
+  return state
+end
+
+local function recordIntraday(state, timestamp, item, price, quantity, gross)
+  -- Never infer old history from inside an event recorder: on the shared
+  -- engine's fill path the current fill is already present in `state.fills`
+  -- and a backfill here would count it twice. `settleFill` and venue restore
+  -- perform the one-time backfill before they reach this function.
+  normaliseMarketIntraday(state, false)
+  recordIntradayRaw(state, timestamp, item, price, quantity, gross)
 end
 
 --- JSON object keys return from a cold snapshot as strings. New fills index
@@ -1133,6 +1470,10 @@ local function retireDust(host, state, ledger, order, timestamp)
 end
 
 local function settleFill(host, state, ledger, taker, maker, timestamp)
+  -- Do this before the new fill joins `state.fills`. On an upgraded host whose
+  -- ensure path predates intraday state, retained history is backfilled once
+  -- here and the fill about to be written is then recorded exactly once.
+  normaliseMarketIntraday(state)
   local buy = taker.side == "buy" and taker or maker
   local sell = taker.side == "sell" and taker or maker
   local quantity = math.min(int(buy.remaining, 0), int(sell.remaining, 0))
@@ -1265,6 +1606,7 @@ local function settleFill(host, state, ledger, taker, maker, timestamp)
   fillRecorded(state, fill)
   recordCandle(marketDay(state, timestamp, buy.item), price, quantity, gross,
     maker.account, taker.account)
+  recordIntraday(state, timestamp, buy.item, price, quantity, gross)
 
   for _, order in ipairs({ buy, sell }) do
     if int(order.remaining, 0) <= 0 and state.orders[order.id] then
@@ -1897,6 +2239,25 @@ function M.maintain(host, state, timestamp, limit)
   return expireOrders(host, state, host.ledger, timestamp, clamp(limit, 1, 100))
 end
 
+--- Close an entire embedded book during a one-time authority migration.
+--- Every order uses the normal escrow-release path; sorted ids make replay
+--- deterministic. This is not exposed as an unbounded player action.
+function M.retireAll(host, state, timestamp)
+  state = host.ensure(state)
+  local ids = {}
+  for id in pairs(state.orders or {}) do ids[#ids + 1] = id end
+  table.sort(ids)
+  local accounts = {}
+  for _, id in ipairs(ids) do
+    local order = state.orders[id]
+    if order then
+      if type(order.account) == "string" then accounts[order.account] = true end
+      cancelOrder(host, state, host.ledger, order, timestamp, "authority-book-retired")
+    end
+  end
+  return #ids, accounts
+end
+
 --- What a caller needs to render one player's own book, without reading it.
 ---
 --- `playerView` runs twice a message for the acting wallet on EVERY verb, and
@@ -2015,6 +2376,41 @@ local function candleView(state, timestamp, item)
   return days
 end
 
+--- Intraday OHLCV for one market. Interval keys are seconds as strings so the
+--- JSON shape is stable across Lua encoders; rows are positional to avoid
+--- repeating eight field names hundreds of times:
+---
+---   [bucketSeconds, open, high, low, close, baseVolume, quoteVolume, fills]
+---
+--- Empty wall-clock buckets are omitted. The absence is truthful market
+--- inactivity and lets the client choose whether to draw or visually collapse
+--- the gap without the contract inventing prices or volume.
+local function intradayView(state, timestamp, item)
+  normaliseMarketIntraday(state)
+  local out = {}
+  local nowSeconds = int(timestamp, 0) // 1000
+  for _, spec in ipairs(intradaySpecs()) do
+    local rows = ((state.marketIntraday or {})[spec.seconds] or {})[item] or {}
+    local newestBucket = (nowSeconds // spec.seconds) * spec.seconds
+    local oldestBucket = newestBucket - (spec.bars - 1) * spec.seconds
+    local published = {}
+    for at = 1, #rows, INTRADAY_WIDTH do
+      local bucket = int(rows[at], 0)
+      if bucket >= oldestBucket and bucket <= newestBucket then
+        published[#published + 1] = {
+          bucket,
+          int(rows[at + 1], 0), int(rows[at + 2], 0),
+          int(rows[at + 3], 0), int(rows[at + 4], 0),
+          int(rows[at + 5], 0), int(rows[at + 6], 0),
+          int(rows[at + 7], 0),
+        }
+      end
+    end
+    out[tostring(spec.seconds)] = published
+  end
+  return out
+end
+
 local function orderView(state)
   local rows = {}
   for _, order in pairs(state.orders) do rows[#rows + 1] = copy(order) end
@@ -2042,6 +2438,7 @@ M.appendBounded = appendBounded
 M.bandView = bandView
 M.bookIndex = bookIndex
 M.candleView = candleView
+M.intradayView = intradayView
 M.dropOrder = dropOrder
 M.fillDigest = fillDigest
 M.fillRecorded = fillRecorded
@@ -2049,6 +2446,7 @@ M.ladder = ladder
 M.marketDay = marketDay
 M.marketId = marketId
 M.normaliseMarketDaily = normaliseMarketDaily
+M.normaliseMarketIntraday = normaliseMarketIntraday
 M.mode = mode
 M.newMarket = newMarket
 M.orderView = orderView
@@ -2069,9 +2467,14 @@ M.ensureIndex = function(state)
   return state
 end
 M.recordCandle = recordCandle
+M.recordIntraday = recordIntraday
 M.noteRejection = recordRejected
 M.rememberAction = rememberAction
 M.replayedAction = replayedAction
 M.touchBook = touchBook
+M.tapeView = tapeView
+M.receiptTimestamp = receiptTimestamp
+M.exportReceiptRows = exportReceiptRows
+M.restoreReceiptRows = restoreReceiptRows
 
 return M

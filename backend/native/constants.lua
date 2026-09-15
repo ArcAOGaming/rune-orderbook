@@ -437,11 +437,10 @@ C.ACTIVITIES = {
 C.MAX_ENERGY = 100
 C.MAX_HAPPINESS = 100
 
---- Battles granted per arena session. Entering the arena is still free of Gold;
---- what bounds a session is the 25 happiness it costs, and happiness comes only
---- from a fifteen-minute Play. Four actions an hour is the ceiling, for
---- everyone. The Gold is charged per BATTLE (see `C.ARENA`), not per session,
---- so leaving early never forfeits a stake that was never taken.
+--- Battles granted per arena session. Entering the arena deducts no Gold, but
+--- the purse must cover all four fights before the run opens so a player cannot
+--- be stranded halfway through it. Gold is still charged per BATTLE (see
+--- `C.ARENA`), so leaving early never forfeits a stake that was never taken.
 C.BATTLES_PER_SESSION = 4
 
 -- Arena stakes --------------------------------------------------------------
@@ -487,6 +486,8 @@ C.BATTLES_PER_SESSION = 4
 -- surface, and it stays closed. What moves the payout is the TIER's recent
 -- results, through the pot: a run of losses fattens it and the next win takes a
 -- third of a bigger number.
+local ARENA_STAKE = 10
+
 C.ARENA = {
   --- Per BATTLE, not per session, and the same in every tier.
   ---
@@ -495,10 +496,7 @@ C.ARENA = {
   --- is worth more" falls out of the arithmetic instead of being a fifth
   --- constant somebody has to keep in step with the difficulty curve.
   ---
-  --- 10 against a quest's `goldReward = 15`: one quest buys one fight, which is
-  --- the onboarding order this was chosen with. A new wallet quests, then
-  --- fights.
-  stake = 10,
+  stake = ARENA_STAKE,
   --- The drain, as a rational so the arithmetic stays in integers.
   ---
   --- `floor(pot * drainNum / drainDen)`. A third is responsive without being
@@ -507,12 +505,34 @@ C.ARENA = {
   --- how big a single win feels.
   drainNum = 1,
   drainDen = 3,
-  --- What a player must hold to enter the arena at all: one battle's stake.
-  ---
-  --- Not a session's worth. A player who can afford one fight is allowed in and
-  --- stopped at the second, which is a truthful place to be stopped; refusing
-  --- entry at 39 Gold to somebody who only wanted one battle is not.
-  minEntry = 10,
+  --- What a player must HOLD to open the run. Nothing is deducted here: each
+  --- stake still moves only when its fight starts. Derived from the same two
+  --- constants as the run so changing either cannot make this gate lie.
+  minEntry = ARENA_STAKE * C.BATTLES_PER_SESSION,
+  --- Player-level Elo. Automatic matchmaking is rated; manual duels and
+  --- PvE never touch it.
+  --- `ratingScale` is the standard Elo 400-point expectation curve and K=32
+  --- keeps early movement legible without letting one result erase a history.
+  ratingStart = 1000,
+  ratingK = 32,
+  ratingScale = 400,
+  --- A new rating has no evidence behind it. When both players are in their
+  --- first ten rated results, move twice as quickly; any established player
+  --- keeps the pair on the ordinary K=32 curve. One K keeps it zero-sum.
+  ratingProvisionalGames = 10,
+  ratingProvisionalK = 64,
+  --- Rated matchmaking stays on the account authority. A queued player adds
+  --- one fixed-size record to their existing account; no battle, worker, or
+  --- public queue is created until a second player actually matches.
+  matchmakingMaxWaitMs = 5 * 60 * 1000,
+  matchmakingMaxEntries = 64,
+  matchmakingBands = {
+    { afterMs = 0,               rating = 100, level = 1 },
+    { afterMs = 1 * 60 * 1000,   rating = 150, level = 2 },
+    { afterMs = 2 * 60 * 1000,   rating = 225, level = 3 },
+    { afterMs = 3 * 60 * 1000,   rating = 325, level = 4 },
+    { afterMs = 4 * 60 * 1000,   rating = 450, level = 5 },
+  },
   --- The pots, and the buckets a numeric difficulty falls into.
   ---
   --- `Difficulty` arrives as a NUMBER the client picks off a row of four
@@ -976,6 +996,10 @@ C.ECONOMY = {
     feeBps = 200,
     expiry = 30 * 24 * 3600 * 1000,
     historyLimit = 500,
+    --- Public, address-free recent trades. One bound for the entire venue,
+    --- never one bound per market: adding a market must not silently enlarge
+    --- every slot's published map.
+    tapeLimit = 96,
     --- The trader picks how long a quote lives; this is the ceiling and the
     --- default. A maker wants an order that retires itself; the cap is what
     --- keeps published state bounded. See ORDERBOOK.md §9.
@@ -1002,6 +1026,14 @@ C.ECONOMY = {
     --- Days of OHLCV kept and published per market. Candles are what the
     --- chart reads past the end of the fills list; ~40 bytes a day each.
     candleDays = 30,
+    --- Durable intraday OHLCV. `seconds` is both the bucket width and the
+    --- public interval id; `bars` is a hard per-market cap. Together these
+    --- retain three hours at one minute and one day at five minutes without
+    --- letting trade history grow with process age.
+    intraday = {
+      { seconds = 60, bars = 180 },
+      { seconds = 300, bars = 288 },
+    },
   },
   shop = {
     accountWindow = 20 * 3600 * 1000,

@@ -272,6 +272,23 @@ local function run()
   ok("a taker fills against it", fillCount(r) == 1, json.encode(r))
   ok("and pays the resting price", num((fillOf(r) or {}).price) == 10, json.encode(r))
   ok("the buyer has the berries", freeOf(r, "fire_berry") == 20, json.encode(r))
+  local internalCandles = json.decode(fillRes.venuecandles or "{}")
+  local oneMinute = internalCandles["fire_berry/gold"]
+    and internalCandles["fire_berry/gold"]["60"] or {}
+  local firstMinute = oneMinute[1]
+  ok("a fill publishes a one-minute OHLCV tuple for its market",
+     type(firstMinute) == "table" and #firstMinute == 8
+       and num(firstMinute[2]) == 10 and num(firstMinute[3]) == 10
+       and num(firstMinute[4]) == 10 and num(firstMinute[5]) == 10
+       and num(firstMinute[6]) == 20 and num(firstMinute[7]) == 200
+       and num(firstMinute[8]) == 1,
+     fillRes.venuecandles)
+  ok("the candle bucket is epoch seconds aligned to one minute",
+     firstMinute and num(firstMinute[1]) == (1700000027 // 60) * 60,
+     firstMinute and firstMinute[1])
+  ok("every published candle fact is a raw integer, never a float",
+     string.find(fillRes.venuecandles or "", "%d+%.%d") == nil,
+     fillRes.venuecandles)
   local makerPosition = json.decode(fillRes["balance-" .. ALICE] or "{}")
   ok("a taker fill republishes the resting maker's complete position",
      makerPosition and makerPosition.free and num(makerPosition.free.gold) == 1199
@@ -314,6 +331,12 @@ local function run()
        and num(Book.orders.O3.remaining) == 399 and num(Book.orders.O3.price) == 12
        and Deposits[GAME .. ":d7"] ~= nil,
      tostring(VenueMode) .. " / " .. tostring(Book and Book.orderSeq))
+  local restoredMinute = OrderBook.intradayView(Book, T, "fire_berry")["60"][1]
+  ok("and canonicalises the restored string interval keys without losing candles",
+     Book.marketIntraday[60] ~= nil and Book.marketIntraday["60"] == nil
+       and restoredMinute and num(restoredMinute[6]) == 20
+       and num(restoredMinute[8]) == 1,
+     tostring(Book.marketIntraday))
 
   r = send(ALICE, { Action = "Withdraw", Asset = "fire_berry", Quantity = "200" })
   ok("what a resting order holds cannot be withdrawn", errOf(r) ~= nil, json.encode(r))
@@ -600,6 +623,84 @@ local function run()
   ok("it publishes `venueinfo` instead", published.venueinfo ~= nil, nil)
   ok("and never the raw order list", published.orders == nil, published.orders)
   ok("nor the raw fill list", published.fills == nil, published.fills)
+  local tape = json.decode(published.venuetape or "{}")
+  local tapeRow = tape["rune/relic"] and tape["rune/relic"][1]
+  ok("the public tape keeps only four integer trade facts",
+     type(tapeRow) == "table" and #tapeRow == 4
+       and string.find(published.venuetape or "", "%[%d+,%d+,%d+,[01]%]") ~= nil,
+     published.venuetape)
+  ok("and publishes no trader address", not string.find(
+       published.venuetape or "", ALICE, 1, true), published.venuetape)
+  local publishedCandles = json.decode(published.venuecandles or "{}")
+  local runeMinute = publishedCandles["rune/relic"]
+    and publishedCandles["rune/relic"]["60"] or {}
+  ok("the venue publishes durable intraday candles separately from depth",
+     type(runeMinute[1]) == "table" and #runeMinute[1] == 8
+       and num(runeMinute[1][2]) == 2000000
+       and num(runeMinute[1][6]) == 10
+       and num(runeMinute[1][7]) == 20000000,
+     published.venuecandles)
+
+  -- The shared engine keeps real OHLC and hard time-window bounds -----------
+
+  local sample = { fills = {} }
+  local sampleAt = 1800000000000
+  OrderBook.recordIntraday(sample, sampleAt + 1000, "rune", 105, 2, 210)
+  OrderBook.recordIntraday(sample, sampleAt + 2000, "rune", 111, 3, 333)
+  OrderBook.recordIntraday(sample, sampleAt + 3000, "rune", 99, 1, 99)
+  local sampleMinute = OrderBook.intradayView(sample, sampleAt + 3000, "rune")["60"][1]
+  ok("one-minute aggregation preserves open, high, low and close in order",
+     sampleMinute and num(sampleMinute[2]) == 105 and num(sampleMinute[3]) == 111
+       and num(sampleMinute[4]) == 99 and num(sampleMinute[5]) == 99,
+     json.encode(sampleMinute))
+  ok("and sums base volume, quote volume and fill count",
+     sampleMinute and num(sampleMinute[6]) == 6 and num(sampleMinute[7]) == 642
+       and num(sampleMinute[8]) == 3,
+     json.encode(sampleMinute))
+
+  local legacy = { fills = {
+    { item = "rune", price = 104, quantity = 2, filledAt = sampleAt + 1000 },
+    { item = "rune", price = 108, quantity = 1, filledAt = sampleAt + 2000 },
+  } }
+  OrderBook.normaliseMarketIntraday(legacy)
+  local migratedMinute = OrderBook.intradayView(
+    legacy, sampleAt + 2000, "rune")["60"][1]
+  ok("a daily-only deployment backfills new intraday state from retained fills once",
+     migratedMinute and num(migratedMinute[2]) == 104
+       and num(migratedMinute[5]) == 108 and num(migratedMinute[6]) == 3
+       and num(migratedMinute[7]) == 316 and num(migratedMinute[8]) == 2,
+     json.encode(migratedMinute))
+
+  local bounded = { fills = {} }
+  for i = 0, 1500 do
+    local price = 100 + (i % 7)
+    OrderBook.recordIntraday(bounded, sampleAt + i * 60000,
+      "rune", price, 1, price)
+  end
+  local boundedView = OrderBook.intradayView(
+    bounded, sampleAt + 1500 * 60000, "rune")
+  ok("one-minute history is hard-capped at three hours",
+     #boundedView["60"] == 180
+       and num(boundedView["60"][1][1])
+         == ((sampleAt // 1000 + 1500 * 60) // 60) * 60 - 179 * 60,
+     #boundedView["60"])
+  ok("five-minute history is hard-capped at twenty-four hours",
+     #boundedView["300"] == 288
+       and num(boundedView["300"][1][1])
+         == ((sampleAt // 1000 + 1500 * 60) // 300) * 300 - 287 * 300,
+     #boundedView["300"])
+  ok("authoritative intraday rows stay flat instead of retaining a table per bar",
+     #bounded.marketIntraday[60].rune == 180 * 8
+       and type(bounded.marketIntraday[60].rune[1]) == "number",
+     #bounded.marketIntraday[60].rune)
+  local capacityPayload = {}
+  for _, id in ipairs({ "air_berry/gold", "fire_berry/gold", "rock_berry/gold",
+    "water_berry/gold", "scroll/gold", "legendary_scroll/gold", "rune/gold" }) do
+    capacityPayload[id] = boundedView
+  end
+  local capacityBytes = #encode(capacityPayload)
+  ok("seven fully occupied markets stay within a measured 120 KB candle key",
+     capacityBytes < 120 * 1024, capacityBytes)
 
   -- The state export drops only what a restore can rebuild --------------------
 
@@ -613,12 +714,15 @@ local function run()
      .. "anchored on their median and nothing else republishes them",
      type(exported.fills) == "table", nil)
   ok("and the replay guard, whose loss would re-arm a double-place",
-     type(exported.actionReceipts) == "table", nil)
+     type(exported.receiptRows) == "table" and exported.actionReceipts == nil, nil)
   ok("and every id sequence, pool, fee and market",
      exported.orderSeq ~= nil and exported.fillSeq ~= nil
        and type(exported.pools) == "table" and type(exported.fees) == "table"
        and type(exported.markets) == "table" and type(exported.orders) == "table"
        and type(exported.marketDaily) == "table",
+     published.venuebookstate)
+  ok("and does not duplicate the candles already published under their own key",
+     exported.marketIntraday == nil and exported.marketIntradayVersion == nil,
      published.venuebookstate)
 
   -- A resolved replay guard is published as its status and nothing more, and

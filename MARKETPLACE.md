@@ -15,9 +15,12 @@
 > The integrated Gold/P2P/NPC implementation follows
 > [ECONOMY_MARKETPLACE_PLAN.md](ECONOMY_MARKETPLACE_PLAN.md).
 
-The market has three user-facing surfaces. Gold goods orders and the finite NPC
+The market has three settlement surfaces. Gold goods orders and the finite NPC
 shop settle inside the game authority, companion sales use in-game Rune in that
-same authority. Wallet Rune/TEST-RELIC will trade on the external order book.
+same authority. Wallet Rune/TEST-RELIC trades on the external order book. A
+fourth, clearly labelled **Chart Lab** is client-only: deterministic synthetic
+markets exercise dense, gapped, volatile and flat chart states without a
+wallet, process, deposit or order.
 
 ## Architecture
 
@@ -58,6 +61,19 @@ NOT on the deleted pool's version, which fell back to a tag for identity and
 failed closed before crediting. Fourteen atoms of TEST-RUNE are stranded at the
 old pool address as a result, and they are not recoverable.
 
+The public `venuetape` remains a 96-row, venue-wide moving tail for the recent
+trade list and line chart. `venuecandles` is the durable intraday chart feed: it
+publishes sparse, address-free OHLCV tuples per market at one-minute and
+five-minute resolutions, bounded to 180 and 288 rows respectively. Larger
+intraday intervals are folded from the five-minute rows in the browser; the
+existing named daily candles in `venuebook` remain the long-range feed.
+
+For a venue deployed before `venuecandles` existed, the UI reads the already-
+published `venuebookstate` once on mount and projects its retained 500-fill
+restore ring into the same address-free trade tuples. Trader addresses are
+discarded before the data reaches a component. This compatibility backfill is
+bounded by fills; it is not a substitute for the new candle feed.
+
 The always-fills-now counterparty is the in-game **Shop**, and it is not a market
 maker: it is a supply-policy desk inside `game.lua`, quoting an anchored, banded
 price that answers to the issuance ledger. A book with no resting order simply
@@ -83,7 +99,10 @@ path on the target node before configuring AO.
   external processes and writes their frontend ids; it never creates an index
   or companion collection.
 - `src/screens/Marketplace.tsx` — `/market`, monster trading, Rune bridge,
-  Gold goods/P2P/NPC trading, TEST-RELIC faucet, liquidity, charts, and swaps.
+  Gold goods/P2P/NPC trading, TEST-RELIC faucet, liquidity, charts, and the
+  read-only Chart Lab at `/market?venue=lab`.
+- `src/lib/market-chart-lab.ts` — deterministic client-only market fixtures;
+  imports no network or signing client.
 - `src/lib/marketplace.ts` — reads, signed actions and exact decimal conversion.
 - `src/lib/venue.ts` — shared order, custody, and published-position client.
 
