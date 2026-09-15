@@ -7,6 +7,7 @@ import { MarketOverview } from '@runerealm/orderbook-ui';
 const NODE = import.meta.env.VITE_ORDERBOOK_NODE || 'https://hyperbeam.tylerw.ai';
 const PROCESS = import.meta.env.VITE_ORDERBOOK_PROCESS
   || 'g9deoTqVy9Uf7fKDZunf4alfbRh0LXE01uyg1czgrn4';
+const RUNE_REALM_URL = import.meta.env.VITE_RUNE_REALM_URL?.trim();
 
 export default function App() {
   const [info, setInfo] = useState<VenueInfo | null>(null);
@@ -33,7 +34,9 @@ export default function App() {
 
   return (
     <main>
-      <nav><span className="mark">R</span><strong>Rune Orderbook</strong><a href="https://runerealm.com">Enter Rune Realm</a></nav>
+      <nav><span className="mark"><b>R</b></span><strong>Rune Orderbook</strong>
+        {RUNE_REALM_URL && <a href={RUNE_REALM_URL}>Enter Rune Realm</a>}
+      </nav>
       <section className="hero">
         <span className="eyebrow">Price · time · custody</span>
         <h1>A public market<br />with nothing hidden.</h1>

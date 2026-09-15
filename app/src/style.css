@@ -7,7 +7,7 @@ main { width: min(72rem, calc(100% - 2rem)); margin: auto; min-height: 100vh; }
 nav { height: 4.5rem; display: flex; align-items: center; gap: .75rem; border-bottom: 1px solid #34383b; }
 nav a { margin-left: auto; color: #b9c7ca; text-decoration: none; }
 .mark { display: grid; place-items: center; width: 2rem; height: 2rem; border: 1px solid #c9a96d; transform: rotate(45deg); color: #c9a96d; }
-.mark::first-letter { transform: rotate(-45deg); }
+.mark b { transform: rotate(-45deg); font-weight: 500; }
 .hero { padding: clamp(4rem, 10vw, 9rem) 0 5rem; max-width: 50rem; }
 .eyebrow { color: #7fa4aa; text-transform: uppercase; letter-spacing: .18em; font-size: .72rem; }
 h1 { margin: 1rem 0; font-family: Georgia, serif; font-size: clamp(3rem, 8vw, 6.5rem); line-height: .92; font-weight: 400; }

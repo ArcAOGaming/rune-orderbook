@@ -26,5 +26,7 @@ only after `rune-ao` has a product-neutral release.
 
 Run the complete Lua suite against a free public Luerl device with
 `npm run test:contract`. No wallet is used and no process is deployed.
+That networked suite is manual only; pull requests run the deterministic
+constants, type, and app build checks without contacting a live service.
 
 The complete design and protocol record remains in [ORDERBOOK.md](ORDERBOOK.md).

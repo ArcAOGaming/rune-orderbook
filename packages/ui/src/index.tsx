@@ -24,7 +24,8 @@ export function MarketOverview({ info, book }: { info: VenueInfo | null; book: V
               <dl>
                 <div><dt>Bid</dt><dd>{market.bestBid ?? '—'}</dd></div>
                 <div><dt>Ask</dt><dd>{market.bestAsk ?? '—'}</dd></div>
-                <div><dt>Orders</dt><dd>{market.depth.bids.length + market.depth.asks.length}</dd></div>
+                <div><dt>Orders</dt><dd>{[...market.depth.bids, ...market.depth.asks]
+                  .reduce((sum, level) => sum + level.orders, 0)}</dd></div>
               </dl>
             </article>
           ))}
