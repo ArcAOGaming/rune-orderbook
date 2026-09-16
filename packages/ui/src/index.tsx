@@ -3,13 +3,14 @@ import {
   connectWallet, createVenueClient, formatUnits, parseUnits, restoreWallet,
   type VenueAsset, type VenueBook, type VenueCandles, type VenueInfo,
   type VenueMarketBook, type VenueMarketConfig, type VenuePosition, type VenueTape,
-  type VenueTif, type WalletProviderId,
+  type VenueSend, type VenueTif, type WalletProviderId,
 } from '../../client/src/index';
 
 export interface OrderbookHost {
   account?: string | null;
   connect?: () => Promise<string | null>;
   execute?: (action: () => Promise<unknown>, success: string) => Promise<unknown>;
+  send?: VenueSend;
   outsideBalances?: Record<string, string | number>;
   deposit?: (asset: VenueAsset, backingAmount: bigint) => Promise<unknown>;
 }
@@ -106,7 +107,10 @@ export function OrderbookTerminal({
   node, process, embedded = false, host,
   initialMarket = '', initialSide = 'buy', initialPrice = '', initialQuantity = '1',
 }: OrderbookTerminalProps) {
-  const client = useMemo(() => createVenueClient({ node, process }), [node, process]);
+  const client = useMemo(
+    () => createVenueClient({ node, process, send: host?.send }),
+    [host?.send, node, process],
+  );
   const [info, setInfo] = useState<VenueInfo | null>(null);
   const [book, setBook] = useState<VenueBook | null>(null);
   const [tape, setTape] = useState<VenueTape | null>(null);

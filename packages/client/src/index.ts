@@ -49,7 +49,13 @@ export interface VenueSupplyRow {
   scale: string; backingHeld: string;
 }
 export interface OrderOptions { tif?: VenueTif; stp?: VenueStp; expiresIn?: number }
-export interface VenueClientConfiguration { node: string; process: string }
+export interface VenueSendOptions { data?: string; requiredOutbox?: boolean }
+export type VenueSend = <T>(
+  process: string,
+  tags: Array<{ name: string; value: string }>,
+  options?: VenueSendOptions,
+) => Promise<T>;
+export interface VenueClientConfiguration { node: string; process: string; send?: VenueSend }
 
 const PROCESS_ID = /^[A-Za-z0-9_-]{43}$/;
 let sequence = 0;
@@ -65,11 +71,15 @@ export class VenueClient {
   readonly node: string;
   readonly process: string;
   readonly ao: AoBrowserClient;
+  private readonly send: VenueSend;
 
-  constructor({ node, process }: VenueClientConfiguration) {
+  constructor({ node, process, send }: VenueClientConfiguration) {
     this.ao = createAoClient({ node, process });
     this.node = this.ao.node;
     this.process = this.ao.process;
+    this.send = send ?? (<T,>(target: string, tags: Array<{ name: string; value: string }>,
+      options: VenueSendOptions = {}) => createAoClient({ node: this.node, process: target })
+        .send<T>(tags, options));
   }
 
   private async read<T>(key: string): Promise<T> {
@@ -98,7 +108,9 @@ export class VenueClient {
   }
 
   private async write<T>(values: Record<string, string>, requiredOutbox = false): Promise<T> {
-    return unwrap(await this.ao.send<T & { error?: unknown }>(messageTags(values), { requiredOutbox }));
+    return unwrap(await this.send<T & { error?: unknown }>(
+      this.process, messageTags(values), { requiredOutbox },
+    ));
   }
 
   place(side: VenueSide, item: string, price: string | number,
@@ -142,10 +154,11 @@ export class VenueClient {
     return (await token.readJSON<Record<string, string>>('balances'))?.[address] ?? '0';
   }
   depositToken(tokenProcess: string, quantity: string | number) {
-    const token = createAoClient({ node: this.node, process: tokenProcess });
-    return token.send<{ Balance?: string; Reference?: string }>(messageTags({
-      Action: 'Transfer', Recipient: this.process, Quantity: String(quantity),
-    }), { requiredOutbox: true });
+    return this.send<{ Balance?: string; Reference?: string }>(
+      tokenProcess,
+      messageTags({ Action: 'Transfer', Recipient: this.process, Quantity: String(quantity) }),
+      { requiredOutbox: true },
+    );
   }
 }
 
