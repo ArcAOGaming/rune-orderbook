@@ -19,6 +19,10 @@ export interface OrderbookTerminalProps {
   process: string;
   embedded?: boolean;
   host?: OrderbookHost;
+  initialMarket?: string;
+  initialSide?: 'buy' | 'sell';
+  initialPrice?: string;
+  initialQuantity?: string;
 }
 
 const n = (value: unknown) => Number(value ?? 0) || 0;
@@ -98,7 +102,10 @@ export function MarketOverview({ info, book }: { info: VenueInfo | null; book: V
   </section>;
 }
 
-export function OrderbookTerminal({ node, process, embedded = false, host }: OrderbookTerminalProps) {
+export function OrderbookTerminal({
+  node, process, embedded = false, host,
+  initialMarket = '', initialSide = 'buy', initialPrice = '', initialQuantity = '1',
+}: OrderbookTerminalProps) {
   const client = useMemo(() => createVenueClient({ node, process }), [node, process]);
   const [info, setInfo] = useState<VenueInfo | null>(null);
   const [book, setBook] = useState<VenueBook | null>(null);
@@ -108,11 +115,11 @@ export function OrderbookTerminal({ node, process, embedded = false, host }: Ord
   const [position, setPosition] = useState<VenuePosition | null>(null);
   const [account, setAccount] = useState<string | null>(host?.account ?? null);
   const [outside, setOutside] = useState<Record<string, string | number>>(host?.outsideBalances ?? {});
-  const [marketId, setMarketId] = useState('');
-  const [side, setSide] = useState<'buy' | 'sell'>('buy');
+  const [marketId, setMarketId] = useState(initialMarket);
+  const [side, setSide] = useState<'buy' | 'sell'>(initialSide);
   const [tif, setTif] = useState<VenueTif>('GTC');
-  const [price, setPrice] = useState('');
-  const [quantity, setQuantity] = useState('1');
+  const [price, setPrice] = useState(initialPrice);
+  const [quantity, setQuantity] = useState(initialQuantity);
   const [custodyAsset, setCustodyAsset] = useState('');
   const [custodyAmount, setCustodyAmount] = useState('');
   const [walletOpen, setWalletOpen] = useState(false);
@@ -122,6 +129,12 @@ export function OrderbookTerminal({ node, process, embedded = false, host }: Ord
 
   useEffect(() => { setAccount(host?.account ?? null); }, [host?.account]);
   useEffect(() => { setOutside(host?.outsideBalances ?? {}); }, [host?.outsideBalances]);
+  useEffect(() => {
+    if (initialMarket) setMarketId(initialMarket);
+    setSide(initialSide);
+    if (initialPrice) setPrice(initialPrice);
+    if (initialQuantity) setQuantity(initialQuantity);
+  }, [initialMarket, initialPrice, initialQuantity, initialSide]);
 
   const refresh = useCallback(async () => {
     setError('');
