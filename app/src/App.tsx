@@ -4,7 +4,7 @@ import '@runerealm/orderbook-ui/style.css';
 
 const NODE = import.meta.env.VITE_ORDERBOOK_NODE || 'https://hyperbeam.tylerw.ai';
 const PROCESS = import.meta.env.VITE_ORDERBOOK_PROCESS
-  || '3vY3m_0T3Pe5tEDDrGKsWvzridRm1uh8Ua0JS59p8HM';
+  || 'Q9E-ONGRPdZy-166rXBQCyPK1YMoyUobqwIRiHFiKNg';
 const RUNE_REALM_URL = import.meta.env.VITE_RUNE_REALM_URL?.trim();
 
 configureWallet({ appName: 'Rune Orderbook', storageNamespace: 'rune-orderbook' });
