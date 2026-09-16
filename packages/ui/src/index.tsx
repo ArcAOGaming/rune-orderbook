@@ -127,7 +127,10 @@ export function OrderbookTerminal({
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
 
-  useEffect(() => { setAccount(host?.account ?? null); }, [host?.account]);
+  useEffect(() => {
+    setAccount(host?.account ?? null);
+    if (host?.account) setWalletOpen(false);
+  }, [host?.account]);
   useEffect(() => { setOutside(host?.outsideBalances ?? {}); }, [host?.outsideBalances]);
   useEffect(() => {
     if (initialMarket) setMarketId(initialMarket);
