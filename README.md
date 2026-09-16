@@ -9,19 +9,19 @@ npm test
 npm run dev
 ```
 
-The phase-one app is deliberately read-only. It proves that a fresh clone can
-read and render the public venue without carrying Rune Realm's game context.
-Signed custody, order entry, charts, and the complete trading floor move here
-only after `rune-ao` has a product-neutral release.
+The app can run as a standalone product against any compatible venue process.
+It includes wallet connection, deposits and withdrawals, limit/IOC/FOK/post-only
+order entry, live depth, fills, candles, positions, and order cancellation. The
+same terminal is exported for embedding in products such as Rune Realm.
 
 ## Layout
 
-- `contracts/` — focused Lua matching engine, custody process, JSON support,
+- `contracts/` - focused Lua matching engine, custody process, JSON support,
   constants snapshot, and contract suite.
-- `packages/client/` — public read-only venue client and protocol types.
-- `packages/ui/` — shared React market overview used by the standalone app.
-- `app/` — independent Vite landing application.
-- `provenance/` — the exact source commit and orderbook settings used at the
+- `packages/client/` - signed venue client and public protocol types.
+- `packages/ui/` - reusable React trading terminal and styles.
+- `app/` - independent Vite landing page and standalone terminal.
+- `provenance/` - the exact source commit and orderbook settings used at the
   split. `test/constants-drift.test.mjs` keeps the Lua snapshot aligned.
 
 The complete history-filter recipe and rewritten checkpoint parent are recorded

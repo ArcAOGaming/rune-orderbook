@@ -1,51 +1,39 @@
-import { useCallback, useEffect, useState } from 'react';
-import {
-  createVenueClient, type VenueBook, type VenueInfo,
-} from '@runerealm/orderbook-client';
-import { MarketOverview } from '@runerealm/orderbook-ui';
+import { configureWallet } from '@runerealm/orderbook-client';
+import { OrderbookTerminal } from '@runerealm/orderbook-ui';
+import '@runerealm/orderbook-ui/style.css';
 
 const NODE = import.meta.env.VITE_ORDERBOOK_NODE || 'https://hyperbeam.tylerw.ai';
 const PROCESS = import.meta.env.VITE_ORDERBOOK_PROCESS
-  || 'g9deoTqVy9Uf7fKDZunf4alfbRh0LXE01uyg1czgrn4';
+  || '3vY3m_0T3Pe5tEDDrGKsWvzridRm1uh8Ua0JS59p8HM';
 const RUNE_REALM_URL = import.meta.env.VITE_RUNE_REALM_URL?.trim();
 
+configureWallet({ appName: 'Rune Orderbook', storageNamespace: 'rune-orderbook' });
+
 export default function App() {
-  const [info, setInfo] = useState<VenueInfo | null>(null);
-  const [book, setBook] = useState<VenueBook | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-
-  const refresh = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const client = createVenueClient({ node: NODE, process: PROCESS });
-      const [nextInfo, nextBook] = await Promise.all([client.info(), client.book()]);
-      setInfo(nextInfo);
-      setBook(nextBook);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => { void refresh(); }, [refresh]);
-
-  return (
-    <main>
-      <nav><span className="mark"><b>R</b></span><strong>Rune Orderbook</strong>
-        {RUNE_REALM_URL && <a href={RUNE_REALM_URL}>Enter Rune Realm</a>}
-      </nav>
-      <section className="hero">
-        <span className="eyebrow">Price · time · custody</span>
-        <h1>A public market<br />with nothing hidden.</h1>
-        <p>Read the live book without a wallet. Deposit only when you are ready to quote, trade, or withdraw.</p>
-        <div className="actions"><a href="#markets">View markets</a><button onClick={() => void refresh()} disabled={loading}>{loading ? 'Reading…' : 'Refresh'}</button></div>
-      </section>
-      {error && <p className="error" role="alert">{error}</p>}
-      <div id="markets"><MarketOverview info={info} book={book} /></div>
-      <footer>Phase one is read-only. Signed custody and the full trading floor arrive after the AO package boundary is proven.</footer>
-    </main>
-  );
+  return <main>
+    <nav><a className="brand" href="#top" aria-label="Rune Orderbook home"><span className="mark"><b>R</b></span>
+      <span><strong>Rune</strong><small>Orderbook</small></span></a>
+      <div className="nav-links"><a href="#markets">Markets</a><a href="#how">Protocol</a>
+        {RUNE_REALM_URL && <a className="realm-link" href={RUNE_REALM_URL}>Rune Realm ↗</a>}</div></nav>
+    <header className="hero" id="top"><div className="hero-copy"><span className="eyebrow">HyperBEAM limit markets</span>
+      <h1>The book is<br /><em>the market.</em></h1>
+      <p>Public price-time priority with deposit-first custody. Read every quote without a wallet. Connect only when you want to place, cancel, deposit or withdraw.</p>
+      <div className="hero-actions"><a href="#markets">Open the live book</a><a className="quiet" href="#how">How settlement works</a></div></div>
+      <div className="hero-ledger" aria-label="Protocol properties"><span>01</span><b>Price before time</b><p>Best price fills first. Equal prices keep their queue order.</p>
+        <span>02</span><b>Funds before orders</b><p>Every resting order is fully backed by venue custody.</p>
+        <span>03</span><b>Exit stays open</b><p>Cancel releases escrow immediately. Withdraw only what is free.</p></div></header>
+    <section id="markets" className="terminal-wrap"><div className="section-heading"><div><span className="eyebrow">Live instrument</span><h2>Rune / Relic</h2></div>
+      <p>The first listed pair proves the generic path. Markets, assets, ticks, lots and fees come from the venue registry—not this page.</p></div>
+      <OrderbookTerminal node={NODE} process={PROCESS} />
+    </section>
+    <section id="how" className="protocol"><div className="section-heading"><div><span className="eyebrow">One engine, explicit custody</span><h2>Nothing fills behind your back.</h2></div>
+      <p>The venue is an account ledger, not a pool. Deposits cross one process boundary; matching and settlement are atomic inside the book.</p></div>
+      <div className="protocol-grid"><article><span>Deposit</span><h3>Move the asset once.</h3><p>The token emits a referenced credit notice. Duplicate delivery cannot credit twice.</p></article>
+        <article><span>Quote</span><h3>Choose the worst price.</h3><p>Limit, immediate-or-cancel, fill-or-kill and maker-only orders all remain explicitly priced.</p></article>
+        <article><span>Match</span><h3>The maker sets the price.</h3><p>A crossing order receives the resting quote and any improvement along the ladder.</p></article>
+        <article><span>Withdraw</span><h3>Only free balance leaves.</h3><p>Cancel first to unlock escrow. Referenced outbox delivery makes retries observable.</p></article></div>
+    </section>
+    <footer><div><strong>Rune Orderbook</strong><span>Generic markets on HyperBEAM</span></div>
+      <code>{PROCESS}</code></footer>
+  </main>;
 }

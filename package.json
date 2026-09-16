@@ -1,14 +1,25 @@
 {
-  "name": "rune-orderbook",
+  "name": "@runerealm/orderbook",
+  "version": "0.1.0",
   "private": true,
-  "version": "0.0.0-phase.1",
   "type": "module",
   "workspaces": ["app", "packages/*"],
+  "exports": {
+    "./client": "./packages/client/src/index.ts",
+    "./ui": "./packages/ui/src/index.tsx",
+    "./style.css": "./packages/ui/src/style.css"
+  },
   "scripts": {
     "dev": "npm run dev -w @runerealm/orderbook-app",
     "build": "npm run typecheck -w @runerealm/orderbook-client && npm run typecheck -w @runerealm/orderbook-ui && npm run build -w @runerealm/orderbook-app",
     "test": "node --test test/*.test.mjs && npm run build",
     "test:contract": "bash scripts/test-contract.sh"
+  },
+  "dependencies": {
+    "@runerealm/ao": "git+https://github.com/ArcAOGaming/rune-ao.git#ac71ed8fa2db8ce0ef42028d768bacbe656f7ab4"
+  },
+  "peerDependencies": {
+    "react": "^18.3.1"
   },
   "devDependencies": {
     "typescript": "^5.7.2"

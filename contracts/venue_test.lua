@@ -432,6 +432,59 @@ local function run()
   ok("but markets are still creatable after sealing -- that is the point",
      r and r.market ~= nil, json.encode(r))
 
+  -- Internal centiGold: game Gold stays whole, venue Gold gets two decimals --
+
+  respawn()
+  send(OWNER, { Action = "Admin.Configure", Mode = "internal",
+    Name = "TEST-Rune Realm CentiGold Venue", GameProcess = GAME })
+  r = send(OWNER, { Action = "Admin.ListAsset", Asset = "gold", Name = "Gold",
+    Denomination = "2" })
+  ok("an internal asset publishes its custody denomination",
+     r and r.asset and r.asset.denomination == "2", json.encode(r and r.asset))
+  send(OWNER, { Action = "Admin.ListAsset", Asset = "fire_berry", Name = "Fire Berry" })
+  send(OWNER, { Action = "Admin.CreateMarket", Base = "fire_berry", Quote = "gold",
+    Tick = "1", Lot = "1", MinValue = "100", MaxPrice = "100000000",
+    CreationCost = "0", TakerBps = "0" })
+  send(OWNER, { Action = "Admin.LaunchAll" })
+
+  r = deliver(GAME, { Action = "Venue.Credit", Account = ALICE, Asset = "gold",
+    Quantity = "10", Reference = "cg1" })
+  ok("one whole game Gold becomes one hundred venue units",
+     r and freeOf(r, "gold") == 1000
+       and r.deposit and num(r.deposit.backingAmount) == 10,
+     json.encode(r))
+  deliver(GAME, { Action = "Venue.Credit", Account = BOB, Asset = "fire_berry",
+    Quantity = "10", Reference = "cg2" })
+  send(BOB, { Action = "Order.Place", Side = "sell", Item = "fire_berry",
+    Price = "527", Quantity = "1", Tif = "GTC" })
+  r = send(ALICE, { Action = "Order.Place", Side = "buy", Item = "fire_berry",
+    Price = "527", Quantity = "1", Tif = "IOC" })
+  ok("the book settles a two-decimal 5.27 Gold price exactly",
+     r and r.order and r.order.fills and num(r.order.fills[1].price) == 527
+       and freeOf(r, "gold") == 473,
+     json.encode(r))
+
+  r = send(BOB, { Action = "Withdraw", Asset = "gold", Quantity = "27" })
+  ok("fractional venue Gold cannot be returned as whole game Gold",
+     errOf(r) ~= nil, json.encode(r))
+  local centiWithdrawal, centiRaw = send(BOB,
+    { Action = "Withdraw", Asset = "gold", Quantity = "500" })
+  ok("a complete five Gold returns and leaves the fractional remainder tradable",
+     centiWithdrawal and freeOf(centiWithdrawal, "gold") == 27
+       and centiWithdrawal.withdrawal
+       and num(centiWithdrawal.withdrawal.backingAmount) == 5,
+     json.encode(centiWithdrawal))
+  ok("the internal return crosses back in whole Gold units",
+     sent(centiRaw, "withdraw").Quantity == "5",
+     json.encode(sent(centiRaw, "withdraw")))
+  local centiSupply = send(OWNER, { Action = "Supply" })
+  ok("supply exposes atomic and whole backing totals without rounding",
+     centiSupply and centiSupply.gold
+       and num(centiSupply.gold.held) == 500
+       and num(centiSupply.gold.scale) == 100
+       and num(centiSupply.gold.backingHeld) == 5,
+     json.encode(centiSupply and centiSupply.gold))
+
   -- =========================================================================
   -- THE EXTERNAL VENUE: real tokens, TEST-RUNE against TEST-RELIC
   -- =========================================================================
@@ -899,8 +952,10 @@ local function run()
   -- A market fee is bounded on BOTH sides --------------------------------------
 
   r = send(OWNER, { Action = "Admin.ListAsset", Asset = "shard", Name = "TEST-Shard",
-    Process = "SHARDtokennnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn", Denomination = "0" })
-  ok("a third asset lists", r and r.asset and r.asset.id == "shard", json.encode(r))
+    Process = "SHARDtokennnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn", Denomination = "18" })
+  ok("a third asset lists with the supported maximum token denomination",
+     r and r.asset and r.asset.id == "shard" and r.asset.denomination == "18",
+     json.encode(r))
   r = send(OWNER, { Action = "Admin.CreateMarket", Base = "shard", Quote = "relic",
     TakerBps = "1000000" })
   ok("a hundredfold taker fee is refused",

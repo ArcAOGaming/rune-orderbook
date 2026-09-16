@@ -1,10 +1,13 @@
 {
   "name": "@runerealm/orderbook-client",
   "private": true,
-  "version": "0.0.0-phase.1",
+  "version": "0.1.0",
   "type": "module",
   "exports": "./src/index.ts",
   "scripts": {
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@runerealm/ao": "git+https://github.com/ArcAOGaming/rune-ao.git#ac71ed8fa2db8ce0ef42028d768bacbe656f7ab4"
   }
 }

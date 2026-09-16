@@ -66,7 +66,7 @@ GameProcess = GameProcess or ""
 
 --- assetId -> row.
 ---
----   internal  { id, name, kind = "game" }
+---   internal  { id, name, kind = "game", denomination }
 ---   external  { id, name, kind = "token", process, ticker, denomination }
 ---
 --- `id` is what the book calls the asset and what a market names. It is a
@@ -133,6 +133,18 @@ local function int(v, default)
 end
 
 local function asString(n) return string.format("%d", int(n, 0)) end
+
+--- Display denomination is also the custody scale for INTERNAL game assets.
+--- External tokens already arrive in atomic units, so their denomination is
+--- descriptive only and must never multiply a Credit-Notice.
+local function assetScale(asset)
+  if VenueMode ~= "internal" then return 1 end
+  local row = Assets[tostring(asset or "")]
+  local denomination = math.max(0, math.min(12, int(row and row.denomination, 0)))
+  local scale = 1
+  for _ = 1, denomination do scale = scale * 10 end
+  return scale
+end
 
 --- A quantity that is safe to move: positive, whole, and nothing else.
 local function quantity(v)
@@ -767,12 +779,19 @@ local function supplyView()
   for id in pairs(Assets) do
     local row = pool(id)
     local player, escrow, locked = int(row.player, 0), int(row.escrow, 0), int(row.locked, 0)
+    local held = player + escrow + locked
+    local fees = int(Book.fees[id], 0)
+    local scale = assetScale(id)
     out[id] = {
       free = asString(player),
       escrow = asString(escrow),
       locked = asString(locked),
-      held = asString(player + escrow + locked),
-      fees = asString(int(Book.fees[id], 0)),
+      held = asString(held),
+      fees = asString(fees),
+      scale = asString(scale),
+      -- The game's own supply ledger remains whole-unit. This is the exact
+      -- number it must report at the venue when an internal asset has decimals.
+      backingHeld = asString((held + fees) // scale),
     }
   end
   return out
@@ -963,7 +982,7 @@ end
 --- leave no record of it at all and the depositor would be out their tokens
 --- with nothing to point at. A quarantined row is keyed on the same reference,
 --- so a repeat delivery still cannot pay.
-local function settleDeposit(base, reference, account, asset, amount, timestamp)
+local function settleDeposit(base, reference, account, asset, amount, timestamp, backingAmount)
   local seen = Deposits[reference]
   if seen then return reply(base, { deposit = seen, unchanged = true }) end
 
@@ -971,6 +990,7 @@ local function settleDeposit(base, reference, account, asset, amount, timestamp)
     Deposits[reference] = {
       id = reference, account = account, asset = asset,
       amount = asString(amount), status = "unresolved", reason = why,
+      backingAmount = backingAmount ~= nil and asString(backingAmount) or nil,
       noticedAt = timestamp,
     }
     return reply(base, { deposit = Deposits[reference] })
@@ -986,6 +1006,7 @@ local function settleDeposit(base, reference, account, asset, amount, timestamp)
   Deposits[reference] = {
     id = reference, account = account, asset = asset,
     amount = asString(amount), status = "credited", creditedAt = timestamp,
+    backingAmount = backingAmount ~= nil and asString(backingAmount) or nil,
   }
   return reply(base, {
     deposit = Deposits[reference], account = accountView(account, timestamp),
@@ -1039,9 +1060,11 @@ H["Venue.Credit"] = function(base, msg, timestamp, b)
   if type(reference) ~= "string" or reference == "" then
     return fail(base, "A venue credit must carry a Reference")
   end
+  local asset = tostring(tag(msg, "Asset", "Item") or "")
+  local backingAmount = int(tag(msg, "Quantity"), 0)
+  local amount = math.tointeger(backingAmount * assetScale(asset)) or 0
   return settleDeposit(base, from .. ":" .. reference,
-    tag(msg, "Account", "PlayerId"), tostring(tag(msg, "Asset", "Item") or ""),
-    int(tag(msg, "Quantity"), 0), timestamp)
+    tag(msg, "Account", "PlayerId"), asset, amount, timestamp, backingAmount)
 end
 
 -- Withdrawals ------------------------------------------------------------------
@@ -1069,6 +1092,12 @@ H["Withdraw"] = function(base, msg, timestamp, b)
 
   local amount, why = quantity(tag(msg, "Quantity"))
   if not amount then return fail(base, why) end
+  local scale = assetScale(asset)
+  if VenueMode == "internal" and amount % scale ~= 0 then
+    return fail(base, "Internal withdrawals return whole " .. tostring(row.name or asset)
+      .. "; leave the fractional balance here until it reaches one")
+  end
+  local backingAmount = VenueMode == "internal" and (amount // scale) or amount
   local free = balanceOf(who, asset)
   if free < amount then
     return fail(base, "You hold " .. asString(free) .. " free; cancel an order to free more")
@@ -1082,6 +1111,7 @@ H["Withdraw"] = function(base, msg, timestamp, b)
   local id = "w" .. asString(WithdrawSeq)
   Withdrawals[id] = {
     id = id, account = who, asset = asset, amount = asString(amount),
+    backingAmount = asString(backingAmount),
     status = "pending", requestedAt = timestamp, settledAt = 0,
   }
 
@@ -1097,7 +1127,7 @@ H["Withdraw"] = function(base, msg, timestamp, b)
     out = { ["withdraw"] = {
       target = GameProcess, Action = "Venue.Return",
       Account = who, PlayerId = who,
-      Asset = asset, Item = asset, Quantity = asString(amount),
+      Asset = asset, Item = asset, Quantity = asString(backingAmount),
       Reference = id, ["Withdrawal-Id"] = id,
     } }
   end
@@ -1175,8 +1205,9 @@ H["Admin.Configure"] = function(base, msg, _, b)
   return reply(base, { info = infoView() })
 end
 
---- List an asset. External assets name a token process and its denomination;
---- internal ones name nothing, because there is nothing to name.
+--- List an asset. External assets name a token process. Both modes may publish
+--- a denomination: on a token it describes incoming atoms; on an internal
+--- game asset it is the exact custody scale applied at the bridge.
 H["Admin.ListAsset"] = function(base, msg, _, b)
   local refusal = requireOwner(base, msg, b)
   if refusal then return refusal end
@@ -1188,6 +1219,11 @@ H["Admin.ListAsset"] = function(base, msg, _, b)
     return fail(base, "An asset id is 1-32 characters of a-z, 0-9 and _")
   end
   local name = tostring(tag(msg, "Name") or id)
+  local denomination = int(tag(msg, "Denomination"), 0)
+  local maximumDenomination = VenueMode == "external" and 18 or 12
+  if denomination < 0 or denomination > maximumDenomination then
+    return fail(base, "Denomination must be between 0 and " .. asString(maximumDenomination))
+  end
 
   if VenueMode == "external" then
     local processId = tag(msg, "Process", "Token", "TokenProcess")
@@ -1201,11 +1237,11 @@ H["Admin.ListAsset"] = function(base, msg, _, b)
     Assets[id] = {
       id = id, name = name, kind = "token", process = processId,
       ticker = tostring(tag(msg, "Ticker") or ""),
-      denomination = int(tag(msg, "Denomination"), 0),
+      denomination = denomination,
     }
     AssetByProcess[processId] = id
   else
-    Assets[id] = { id = id, name = name, kind = "game" }
+    Assets[id] = { id = id, name = name, kind = "game", denomination = denomination }
   end
   pool(id)
   return reply(base, { asset = assetView()[id] })
