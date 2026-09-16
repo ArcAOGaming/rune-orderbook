@@ -16,7 +16,7 @@
     "test:contract": "bash scripts/test-contract.sh"
   },
   "dependencies": {
-    "@runerealm/ao": "git+https://github.com/ArcAOGaming/rune-ao.git#ac71ed8fa2db8ce0ef42028d768bacbe656f7ab4"
+    "@runerealm/ao": "https://github.com/ArcAOGaming/rune-ao/archive/ac71ed8fa2db8ce0ef42028d768bacbe656f7ab4.tar.gz"
   },
   "peerDependencies": {
     "react": "^18.3.1"
