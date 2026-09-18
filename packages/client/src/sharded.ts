@@ -80,6 +80,18 @@ const unwrap = <T>(value: T): T => {
 let sequence = 0;
 const actionId = (kind: string) => `${kind}-${Date.now().toString(36)}-${(++sequence).toString(36)}`;
 
+/** An order-book result with its order and fill ids made unique across pairs. */
+function withPairIds(pair: string, result: Record<string, unknown> | undefined) {
+  if (!result) return result;
+  const order = result.order as { id?: string } | undefined;
+  const fills = result.fills as Array<{ id?: string }> | undefined;
+  return {
+    ...result,
+    ...(order?.id ? { order: { ...order, id: `${pair}${SEPARATOR}${order.id}` } } : {}),
+    ...(Array.isArray(fills) ? { fills: fills.map((f) => ({ ...f, id: `${pair}${SEPARATOR}${f.id}` })) } : {}),
+  };
+}
+
 export function splitOrderId(id: string): { pair: string; order: string } {
   const at = id.indexOf(SEPARATOR);
   if (at <= 0) throw new Error(`Order id ${id} does not name its pair`);
@@ -304,21 +316,39 @@ export class ShardedVenue {
     return pair.process;
   }
 
-  /** Send `final` to `destination`, first gathering `amount` of `asset` there. */
+  /**
+   * A contract reply in the single venue's shape, plus the account summed over
+   * every location -- a pair's own `account` only knows that pair, and a
+   * caller that cached it would forget the rest of the player's funds.
+   */
+  private async shaped<T>(address: string | undefined, raw: unknown,
+                          extra: (first: Record<string, unknown> | undefined) => Record<string, unknown>) {
+    const reply = unwrap(raw as { results?: Array<{ op?: string; result?: Record<string, unknown> }> });
+    const first = reply?.results?.[0]?.result;
+    const account = address ? await this.position(address) : undefined;
+    return { ...(reply as object), ...extra(first), ...(account ? { account } : {}) } as unknown as T;
+  }
+
+  /**
+   * Send `final` to `destination`, first gathering `amount` of `asset` there.
+   * `routed` says the funds had to move: the step then runs one hop later, at
+   * the destination, and its result is not in this reply.
+   */
   private async routed<T>(
     address: string, asset: string, amount: bigint, destination: string,
     final: Record<string, unknown>, direct: Record<string, string>,
+    extra: (first: Record<string, unknown> | undefined) => Record<string, unknown>,
   ): Promise<T> {
     const pairs = await this.pairs();
     const position = await this.position(address);
     const route = planRoute(this.held(position, asset), asset, amount, destination, [final]);
     if (!route) {
-      return unwrap(await this.transport.send<T>(this.processOf(destination, pairs), tags(direct),
-        { requiredOutbox: direct.Action === 'Withdraw' }));
+      return this.shaped<T>(address, await this.transport.send(this.processOf(destination, pairs),
+        tags(direct), { requiredOutbox: direct.Action === 'Withdraw' }), extra);
     }
-    return unwrap(await this.transport.send<T>(this.processOf(route.first, pairs), tags({
+    return this.shaped<T>(address, await this.transport.send(this.processOf(route.first, pairs), tags({
       Action: 'Batch', Ops: JSON.stringify(route.ops), ActionId: actionId('route'),
-    }), { requiredOutbox: true }));
+    }), { requiredOutbox: true }), () => ({ routed: true, route: route.ops }));
   }
 
   /**
@@ -353,57 +383,67 @@ export class ShardedVenue {
       ...(options.tif ? { Tif: options.tif } : {}),
       ...(options.stp ? { Stp: options.stp } : {}),
       ...(options.expiresIn ? { ExpiresIn: String(Math.floor(options.expiresIn)) } : {}),
-    });
+    }, (first) => ({ order: withPairIds(pair.id, first) }));
   }
 
   async amend<T>(orderId: string, changes: { price?: string | number; quantity?: string | number },
-                 options: OrderOptions = {}): Promise<T> {
+                 options: OrderOptions = {}, address?: string): Promise<T> {
     const { pair, order } = splitOrderId(orderId);
     const pairs = await this.pairs();
-    return unwrap(await this.transport.send<T>(this.processOf(pair, pairs), tags({
+    return this.shaped<T>(address, await this.transport.send(this.processOf(pair, pairs), tags({
       Action: 'Order.Amend', OrderId: order, ActionId: actionId('amend'),
       ...(changes.price !== undefined ? { Price: String(changes.price) } : {}),
       ...(changes.quantity !== undefined ? { Quantity: String(changes.quantity) } : {}),
       ...(options.tif ? { Tif: options.tif } : {}),
       ...(options.stp ? { Stp: options.stp } : {}),
-    })));
+    })), (first) => ({ order: withPairIds(pair, first) }));
   }
 
-  async cancel<T>(orderId: string): Promise<T> {
+  async cancel<T>(orderId: string, address?: string): Promise<T> {
     const { pair, order } = splitOrderId(orderId);
     const pairs = await this.pairs();
-    return unwrap(await this.transport.send<T>(this.processOf(pair, pairs), tags({
+    return this.shaped<T>(address, await this.transport.send(this.processOf(pair, pairs), tags({
       Action: 'Order.Cancel', OrderId: order, ActionId: actionId('cancel'),
-    })));
+    })), (first) => ({ cancelled: first }));
   }
 
   /** One message per pair that has orders open; each is its own signature. */
-  async cancelAll<T>(address: string, item?: string): Promise<T[]> {
+  async cancelAll<T>(address: string, item?: string): Promise<T> {
     const pairs = await this.pairs();
     const targets = item ? [(await this.pairFor(item)).id]
       : [...new Set((await this.position(address)).orders.map((o) => splitOrderId(o.id).pair))];
-    const out: T[] = [];
+    const cancelledIds: string[] = [];
     for (const id of targets) {
-      out.push(unwrap(await this.transport.send<T>(this.processOf(id, pairs), tags({
+      const reply = unwrap(await this.transport.send<{ results?: Array<{
+        result?: { cancelledIds?: string[] } }> }>(this.processOf(id, pairs), tags({
         Action: 'Order.CancelAll', ActionId: actionId('cancel-all'),
-      }))));
+      })));
+      for (const row of reply?.results?.[0]?.result?.cancelledIds ?? []) {
+        cancelledIds.push(`${id}${SEPARATOR}${row}`);
+      }
     }
-    return out;
+    return { cancelled: { cancelledIds }, account: await this.position(address) } as unknown as T;
   }
 
-  /** Housekeeping on one market; anyone may call it. */
-  async maintain<T>(item: string, limit = 25): Promise<T> {
-    const pair = await this.pairFor(item);
-    return unwrap(await this.transport.send<T>(pair.process, tags({
-      Action: 'Order.Maintain', Limit: String(Math.max(1, Math.floor(limit))),
-    })));
+  /** Housekeeping, on every pair: anyone may call it, nobody is paid to. */
+  async maintain<T>(limit = 25): Promise<T> {
+    let expired = 0;
+    for (const pair of Object.values(await this.pairs())) {
+      const reply = unwrap(await this.transport.send<{ expired?: number }>(pair.process, tags({
+        Action: 'Order.Maintain', Limit: String(Math.max(1, Math.floor(limit))),
+      })));
+      expired += Number(reply?.expired ?? 0) || 0;
+    }
+    return { expired } as unknown as T;
   }
 
   /** Out of the venue, gathering from wherever the balance is. One signature. */
   withdraw<T>(address: string, asset: string, quantity: string | number): Promise<T> {
     return this.routed<T>(address, asset, big(quantity), VAULT,
       { op: 'withdraw', asset, quantity: String(quantity) },
-      { Action: 'Withdraw', Asset: asset, Quantity: String(quantity) });
+      { Action: 'Withdraw', Asset: asset, Quantity: String(quantity) },
+      (first) => ({ withdrawal: first?.withdrawal
+        ? { id: String(first.withdrawal), status: 'pending' } : undefined }));
   }
 
   /**

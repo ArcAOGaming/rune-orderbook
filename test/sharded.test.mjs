@@ -135,3 +135,13 @@ test('a withdrawal gathers from the pairs through the vault in one signature', a
   const [move] = JSON.parse(sent[0].tags.Ops);
   assert.deepEqual([move.to, move.quantity, move.then[0].op], ['vault', '100', 'withdraw']);
 });
+
+test('a reply comes back in the single venue shape, with the summed account', async () => {
+  const { transport } = network(published);
+  transport.send = async () => ({ results: [{ op: 'place', result: { order: { id: 'O5' }, fills: [{ id: 'F2' }] } }] });
+  const venue = new ShardedVenue(transport, VAULT);
+  const reply = await venue.place(ALICE, 'buy', 'fire_berry', 10, 5);
+  assert.equal(reply.order.order.id, 'fire_berry_gold~O5');
+  assert.equal(reply.order.fills[0].id, 'fire_berry_gold~F2');
+  assert.equal(reply.account.free.gold, '5100');
+});
