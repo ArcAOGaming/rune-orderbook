@@ -103,9 +103,11 @@ const vaultCache = new Map<string, Promise<boolean>>();
 export function isVault(transport: ShardedTransport, process: string): Promise<boolean> {
   let known = vaultCache.get(process);
   if (!known) {
+    // A FAILED read is not an answer: forget it and let the caller retry,
+    // or one slow read would pin a vault as a legacy venue for the session.
     known = transport.read<VaultInfo>(process, 'vaultinfo')
       .then((info) => Boolean(info && typeof info === 'object' && 'Funding' in info))
-      .catch(() => false);
+      .catch((error) => { vaultCache.delete(process); throw error; });
     vaultCache.set(process, known);
   }
   return known;
@@ -161,6 +163,7 @@ export function planRoute(
 
 export class ShardedVenue {
   private pairCache?: { at: number; pairs: Record<string, PairEntry> };
+  private pairsInFlight?: Promise<Record<string, PairEntry>>;
   private readonly transport: ShardedTransport;
   readonly vault: string;
 
@@ -174,16 +177,29 @@ export class ShardedVenue {
     catch { return fallback; }
   }
 
-  /** The registry. Re-read every 30 s; pairs are added, never re-pointed. */
+  /**
+   * The registry. Re-read every 30 s; pairs are added, never re-pointed.
+   *
+   * A failed or empty read is THROWN, never cached: caching it made every
+   * market vanish for 30 s after one slow read ("this venue has no open
+   * market"), and a caller that sees an error keeps loading and retries.
+   * Concurrent callers share one in-flight read.
+   */
   async pairs(): Promise<Record<string, PairEntry>> {
     if (this.pairCache && Date.now() - this.pairCache.at < 30_000) return this.pairCache.pairs;
-    const listed = await this.readOr<Record<string, Omit<PairEntry, 'id'>>>(this.vault, 'vaultpairs', {});
-    const pairs: Record<string, PairEntry> = {};
-    for (const [id, row] of Object.entries(Array.isArray(listed) ? {} : listed)) {
-      if (row && typeof row.process === 'string') pairs[id] = { id, ...row };
+    if (!this.pairsInFlight) {
+      this.pairsInFlight = (async () => {
+        const listed = await this.transport.read<Record<string, Omit<PairEntry, 'id'>>>(this.vault, 'vaultpairs');
+        const pairs: Record<string, PairEntry> = {};
+        for (const [id, row] of Object.entries(listed && !Array.isArray(listed) ? listed : {})) {
+          if (row && typeof row.process === 'string') pairs[id] = { id, ...row };
+        }
+        if (!Object.keys(pairs).length) throw new Error('The vault has not published its markets yet');
+        this.pairCache = { at: Date.now(), pairs };
+        return pairs;
+      })().finally(() => { this.pairsInFlight = undefined; });
     }
-    this.pairCache = { at: Date.now(), pairs };
-    return pairs;
+    return this.pairsInFlight;
   }
 
   private async pairFor(item: string): Promise<PairEntry> {
@@ -201,6 +217,10 @@ export class ShardedVenue {
       const value = await this.readOr<T | null>(pair.process, key, null);
       if (value !== null) out[`${pair.base}/${pair.quote}`] = value;
     }));
+    // Every pair publishes each of these keys from its first message, so an
+    // empty answer is a failed read, not an empty venue -- say so rather than
+    // hand the screen a book with no markets in it.
+    if (!Object.keys(out).length) throw new Error(`No pair answered ${key} yet`);
     return out;
   }
 

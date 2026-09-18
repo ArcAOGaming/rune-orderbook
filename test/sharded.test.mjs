@@ -166,3 +166,43 @@ test('an amend that shrinks goes straight to its pair', async () => {
   assert.equal(sent[0].process, FIRE);
   assert.equal(sent[0].tags.Action, 'Order.Amend');
 });
+
+test('a failed registry read is an error, never a cached empty venue', async () => {
+  let reads = 0;
+  const book = structuredClone(published);
+  const { transport } = network(book);
+  const read = transport.read;
+  transport.read = async (process, key) => {
+    if (key === 'vaultpairs') { reads += 1; if (reads === 1) return null; }
+    return read(process, key);
+  };
+  const venue = new ShardedVenue(transport, VAULT);
+  await assert.rejects(venue.book(), /not published its markets/);
+  // The next read goes back to the vault instead of serving a cached nothing.
+  const markets = await venue.markets();
+  assert.deepEqual(Object.keys(markets).sort(), ['fire_berry/gold', 'scroll/gold']);
+});
+
+test('concurrent callers share one registry read', async () => {
+  let reads = 0;
+  const { transport } = network(published);
+  const read = transport.read;
+  transport.read = async (process, key) => { if (key === 'vaultpairs') reads += 1; return read(process, key); };
+  const venue = new ShardedVenue(transport, VAULT);
+  await Promise.all([venue.markets(), venue.position(ALICE), venue.markets()]);
+  assert.equal(reads, 1);
+});
+
+test('a failed vault check is retried, not remembered as "not a vault"', async () => {
+  const { transport } = network(published);
+  const read = transport.read;
+  let fail = true;
+  transport.read = async (process, key) => {
+    if (key === 'vaultinfo' && fail) { fail = false; throw new Error('timeout'); }
+    return read(process, key);
+  };
+  const pid = 'W'.repeat(43);
+  published[pid] = published[VAULT];
+  await assert.rejects(isVault(transport, pid), /timeout/);
+  assert.equal(await isVault(transport, pid), true);
+});
