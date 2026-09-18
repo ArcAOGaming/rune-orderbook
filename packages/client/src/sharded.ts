@@ -386,17 +386,54 @@ export class ShardedVenue {
     }, (first) => ({ order: withPairIds(pair.id, first) }));
   }
 
+  /**
+   * Amend an order. Growing it needs more escrow on its pair; when that is at
+   * the vault or another pair, one batch moves the difference there and runs
+   * the amend on arrival -- the same routing `place` does.
+   */
   async amend<T>(orderId: string, changes: { price?: string | number; quantity?: string | number },
                  options: OrderOptions = {}, address?: string): Promise<T> {
     const { pair, order } = splitOrderId(orderId);
     const pairs = await this.pairs();
-    return this.shaped<T>(address, await this.transport.send(this.processOf(pair, pairs), tags({
+    const direct: Record<string, string> = {
       Action: 'Order.Amend', OrderId: order, ActionId: actionId('amend'),
       ...(changes.price !== undefined ? { Price: String(changes.price) } : {}),
       ...(changes.quantity !== undefined ? { Quantity: String(changes.quantity) } : {}),
       ...(options.tif ? { Tif: options.tif } : {}),
       ...(options.stp ? { Stp: options.stp } : {}),
-    })), (first) => ({ order: withPairIds(pair, first) }));
+    };
+    const extra = (first: Record<string, unknown> | undefined) => ({ order: withPairIds(pair, first) });
+    const resting = address
+      ? (await this.position(address)).orders.find((row) => row.id === orderId) : undefined;
+    const entry = pairs[pair];
+    if (!address || !resting || !entry) {
+      return this.shaped<T>(address, await this.transport.send(this.processOf(pair, pairs), tags(direct)), extra);
+    }
+    const market = (await this.markets())[`${entry.base}/${entry.quote}`];
+    const price = big(changes.price ?? resting.price);
+    const quantity = big(changes.quantity ?? resting.remaining);
+    const remaining = big(resting.remaining);
+    let asset = entry.base;
+    let need = (quantity > remaining ? quantity - remaining : 0n) * (big(resting.lot ?? 1) || 1n);
+    if (resting.side === 'buy') {
+      const before = big(resting.price) * remaining;
+      const after = price * quantity;
+      asset = entry.quote;
+      need = (after > before ? after - before : 0n)
+        + (after * big(market?.takerBps ?? 0) + 9999n) / 10000n;
+    }
+    if (need === 0n) {
+      return this.shaped<T>(address, await this.transport.send(this.processOf(pair, pairs), tags(direct)), extra);
+    }
+    const step: Record<string, string> = {
+      op: 'amend', order,
+      ...(changes.price !== undefined ? { price: String(changes.price) } : {}),
+      ...(changes.quantity !== undefined ? { quantity: String(changes.quantity) } : {}),
+      ...(options.tif ? { tif: options.tif } : {}),
+      ...(options.stp ? { stp: options.stp } : {}),
+    };
+    // What the pair already holds free counts toward it; `routed` tops it up.
+    return this.routed<T>(address, asset, need, pair, step, direct, extra);
   }
 
   async cancel<T>(orderId: string, address?: string): Promise<T> {

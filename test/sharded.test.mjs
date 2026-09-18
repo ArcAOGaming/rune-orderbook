@@ -145,3 +145,24 @@ test('a reply comes back in the single venue shape, with the summed account', as
   assert.equal(reply.order.fills[0].id, 'fire_berry_gold~F2');
   assert.equal(reply.account.free.gold, '5100');
 });
+
+test('an amend that grows a bid gathers the extra Gold and amends on arrival', async () => {
+  const book = structuredClone(published);
+  book[FIRE][`balance-${ALICE}`] = { free: { gold: '0' }, fills: [],
+    orders: [{ id: 'O1', market: 'fire_berry/gold', side: 'buy', price: 10, remaining: 5, lot: 1 }] };
+  const { transport, sent } = network(book);
+  const venue = new ShardedVenue(transport, VAULT);
+  await venue.amend('fire_berry_gold~O1', { quantity: 20 }, {}, ALICE);
+  assert.equal(sent[0].process, VAULT);
+  const [move] = JSON.parse(sent[0].tags.Ops);
+  assert.deepEqual([move.quantity, move.to, move.then[0].op, move.then[0].order], ['150', 'fire_berry_gold', 'amend', 'O1']);
+});
+
+test('an amend that shrinks goes straight to its pair', async () => {
+  const book = structuredClone(published);
+  book[FIRE][`balance-${ALICE}`].orders = [{ id: 'O1', market: 'fire_berry/gold', side: 'buy', price: 10, remaining: 5, lot: 1 }];
+  const { transport, sent } = network(book);
+  await new ShardedVenue(transport, VAULT).amend('fire_berry_gold~O1', { quantity: 2 }, {}, ALICE);
+  assert.equal(sent[0].process, FIRE);
+  assert.equal(sent[0].tags.Action, 'Order.Amend');
+});
