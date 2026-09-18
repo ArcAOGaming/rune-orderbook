@@ -1290,7 +1290,17 @@ recognises a vault by `vaultinfo` and presents the same reads and writes as a
 single venue: positions summed over the vault and every pair (order ids become
 `<pair>~<id>`), and a write whose funds are elsewhere becomes one signed batch
 that gathers them and runs the order where they land (`planRoute`).
-`VenueClient` and Rune Realm's `lib/venue.ts` shim both delegate to it.
+`VenueClient` and Rune Realm's `lib/venue.ts` shim both delegate to it. Every
+write returns the single venue's reply shape with the SUMMED account, because a
+pair's own reply knows only that pair.
+
+The Rune Realm swarm trades through that same shim, so its bots route exactly
+as a player does. Its poller (`swarm/awareness.mjs`) reads `vaultpairs` and then
+each pair's `pairbook`/`pairtape`/`pairinfo`, and it samples the pairs' slots
+and bytes under the roles `pair.internal`/`pair.external`. The admin swarm tab
+shows vaults and pairs together as one "Order book" group, and
+`live-config.mjs` verifies a vault graph (funding, game link, token pair, every
+pair open) instead of `venueinfo`.
 
 ### Not done
 

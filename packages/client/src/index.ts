@@ -1,4 +1,10 @@
 import { createAoClient, type AoBrowserClient } from '@runerealm/ao/client';
+import { activeAddress } from '@runerealm/ao/wallet';
+import { isVault, ShardedVenue, type ShardedTransport } from './sharded';
+export {
+  isVault, planRoute, ShardedVenue, splitOrderId,
+  type ShardedPosition, type ShardedTransport,
+} from './sharded';
 export {
   activeAddress, configureWallet, connectWallet, disconnectWallet, restoreWallet,
   walletAvailability, type WalletAvailability, type WalletConnection, type WalletProviderId,
@@ -19,6 +25,10 @@ export type VenueTrade = [at: number, price: number, quantity: number, takerBoug
 export type VenueTape = Record<string, VenueTrade[]>;
 export type VenueIntradayCandle = [number, number, number, number, number, number, number, number];
 export type VenueCandles = Record<string, { '60'?: VenueIntradayCandle[]; '300'?: VenueIntradayCandle[] }>;
+interface VenuePairPublication {
+  id: string; base: string; quote: string;
+  book: string; candles: string; tape: string;
+}
 export interface VenueAsset {
   id: string; name: string; kind: 'token' | 'game'; process?: string;
   ticker?: string; denomination?: string;
@@ -55,7 +65,11 @@ export type VenueSend = <T>(
   tags: Array<{ name: string; value: string }>,
   options?: VenueSendOptions,
 ) => Promise<T>;
-export interface VenueClientConfiguration { node: string; process: string; send?: VenueSend }
+export interface VenueClientConfiguration {
+  node: string; process: string; send?: VenueSend;
+  /** Who is signing; routing a sharded order needs to know where their funds are. */
+  address?: () => Promise<string | null>;
+}
 
 const PROCESS_ID = /^[A-Za-z0-9_-]{43}$/;
 let sequence = 0;
@@ -72,14 +86,41 @@ export class VenueClient {
   readonly process: string;
   readonly ao: AoBrowserClient;
   private readonly send: VenueSend;
+  private readonly address: () => Promise<string | null>;
+  private sharded?: Promise<ShardedVenue | null>;
 
-  constructor({ node, process, send }: VenueClientConfiguration) {
+  constructor({ node, process, send, address }: VenueClientConfiguration) {
     this.ao = createAoClient({ node, process });
     this.node = this.ao.node;
     this.process = this.ao.process;
     this.send = send ?? (<T,>(target: string, tags: Array<{ name: string; value: string }>,
       options: VenueSendOptions = {}) => createAoClient({ node: this.node, process: target })
         .send<T>(tags, options));
+    this.address = address ?? activeAddress;
+  }
+
+  /**
+   * A vault id means the sharded venue (ORDERBOOK.md §16): the same verbs,
+   * routed across one process per market. Decided once, from `vaultinfo`.
+   */
+  private shard(): Promise<ShardedVenue | null> {
+    if (!this.sharded) {
+      const transport: ShardedTransport = {
+        read: <T,>(process: string, key: string) =>
+          createAoClient({ node: this.node, process }).readJSON<T>(key),
+        send: <T,>(process: string, tags: Array<{ name: string; value: string }>,
+          options?: { requiredOutbox?: boolean }) => this.send<T>(process, tags, options),
+      };
+      this.sharded = isVault(transport, this.process)
+        .then((vault) => (vault ? new ShardedVenue(transport, this.process) : null));
+    }
+    return this.sharded;
+  }
+
+  private async signer(): Promise<string> {
+    const address = await this.address();
+    if (!address || !PROCESS_ID.test(address)) throw new Error('Connect a wallet first.');
+    return address;
   }
 
   private async read<T>(key: string): Promise<T> {
@@ -88,15 +129,51 @@ export class VenueClient {
     return value;
   }
 
-  info() { return this.read<VenueInfo>('venueinfo'); }
-  book() { return this.read<VenueBook>('venuebook'); }
-  tape() { return this.read<VenueTape>('venuetape'); }
-  candles() { return this.read<VenueCandles>('venuecandles'); }
-  markets() { return this.read<Record<string, VenueMarketConfig>>('markets'); }
-  supply() { return this.read<Record<string, VenueSupplyRow>>('supply'); }
+  private async pairViews<T>(
+    field: 'book' | 'candles' | 'tape', legacy: string,
+  ): Promise<Record<string, T>> {
+    let index: Record<string, VenuePairPublication>;
+    try { index = await this.read<Record<string, VenuePairPublication>>('venuepairs'); }
+    catch { return this.read<Record<string, T>>(legacy); }
+    const out: Record<string, T> = {};
+    await Promise.all(Object.entries(index).map(async ([id, pair]) => {
+      if (!pair || typeof pair[field] !== 'string') return;
+      try { out[id] = await this.read<T>(pair[field]); }
+      catch { /* A newly configured pair has no projection until its first write. */ }
+    }));
+    return out;
+  }
+
+  async info(): Promise<VenueInfo> {
+    const s = await this.shard();
+    return s ? s.info() : this.read<VenueInfo>('venueinfo');
+  }
+  async book(): Promise<VenueBook> {
+    const s = await this.shard();
+    return s ? s.book<VenueMarketBook>() : this.pairViews<VenueMarketBook>('book', 'venuebook');
+  }
+  async tape(): Promise<VenueTape> {
+    const s = await this.shard();
+    return s ? s.tape<VenueTrade[]>() : this.pairViews<VenueTrade[]>('tape', 'venuetape');
+  }
+  async candles(): Promise<VenueCandles> {
+    const s = await this.shard();
+    return s ? s.candles<VenueCandles[string]>()
+      : this.pairViews<VenueCandles[string]>('candles', 'venuecandles');
+  }
+  async markets(): Promise<Record<string, VenueMarketConfig>> {
+    const s = await this.shard();
+    return s ? s.markets() : this.read<Record<string, VenueMarketConfig>>('markets');
+  }
+  async supply(): Promise<Record<string, VenueSupplyRow>> {
+    const s = await this.shard();
+    return s ? s.supply() : this.read<Record<string, VenueSupplyRow>>('supply');
+  }
 
   async position(address: string): Promise<VenuePosition> {
     if (!PROCESS_ID.test(address)) return { account: address, free: {}, orders: [], fills: [] };
+    const s = await this.shard();
+    if (s) return s.position(address);
     const value = await this.ao.readJSON<VenuePosition | Record<string, string>>(`balance-${address}`);
     if (value && 'free' in value) {
       const row = value as VenuePosition;
@@ -113,8 +190,13 @@ export class VenueClient {
     ));
   }
 
-  place(side: VenueSide, item: string, price: string | number,
+  async place(side: VenueSide, item: string, price: string | number,
         quantity: string | number, options: OrderOptions = {}) {
+    const s = await this.shard();
+    if (s) {
+      return s.place<{ account: VenuePosition; order: unknown }>(
+        await this.signer(), side, item, price, quantity, options);
+    }
     return this.write<{ account: VenuePosition; order: unknown }>({
       Action: 'Order.Place', Side: side, Item: item, Price: String(price),
       Quantity: String(quantity), ActionId: actionId('order'),
@@ -123,24 +205,40 @@ export class VenueClient {
       ...(options.expiresIn ? { ExpiresIn: String(Math.floor(options.expiresIn)) } : {}),
     });
   }
-  amend(orderId: string, changes: { price?: string | number; quantity?: string | number }) {
+  async amend(orderId: string, changes: { price?: string | number; quantity?: string | number }) {
+    const s = await this.shard();
+    if (s) {
+      return s.amend<{ account: VenuePosition; order: unknown }>(
+        orderId, changes, {}, await this.signer());
+    }
     return this.write<{ account: VenuePosition; order: unknown }>({
       Action: 'Order.Amend', OrderId: orderId, ActionId: actionId('amend'),
       ...(changes.price !== undefined ? { Price: String(changes.price) } : {}),
       ...(changes.quantity !== undefined ? { Quantity: String(changes.quantity) } : {}),
     });
   }
-  cancel(orderId: string) {
+  async cancel(orderId: string) {
+    const s = await this.shard();
+    if (s) return s.cancel<{ account: VenuePosition }>(orderId, await this.signer());
     return this.write<{ account: VenuePosition }>({
       Action: 'Order.Cancel', OrderId: orderId, ActionId: actionId('cancel'),
     });
   }
-  cancelAll(item?: string) {
+  async cancelAll(item?: string) {
+    const s = await this.shard();
+    if (s) {
+      return s.cancelAll<{ account: VenuePosition }>(await this.signer(), item);
+    }
     return this.write<{ account: VenuePosition }>({
       Action: 'Order.CancelAll', ActionId: actionId('cancel-all'), ...(item ? { Item: item } : {}),
     });
   }
-  withdraw(asset: string, quantity: string | number) {
+  async withdraw(asset: string, quantity: string | number) {
+    const s = await this.shard();
+    if (s) {
+      return s.withdraw<{ account: VenuePosition; withdrawal: unknown }>(
+        await this.signer(), asset, quantity);
+    }
     return this.write<{ account: VenuePosition; withdrawal: unknown }>({
       Action: 'Withdraw', Asset: asset, Quantity: String(quantity),
     }, true);

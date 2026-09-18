@@ -4,7 +4,7 @@ import '@runerealm/orderbook-ui/style.css';
 
 const NODE = import.meta.env.VITE_ORDERBOOK_NODE || 'https://hyperbeam.tylerw.ai';
 const PROCESS = import.meta.env.VITE_ORDERBOOK_PROCESS
-  || 'Q9E-ONGRPdZy-166rXBQCyPK1YMoyUobqwIRiHFiKNg';
+  || 'Kd25Uaeggg_m5OIpKtMiF1ZRgRjhYw62dY9kBqeuPbQ';
 const RUNE_REALM_URL = import.meta.env.VITE_RUNE_REALM_URL?.trim();
 
 configureWallet({ appName: 'Rune Orderbook', storageNamespace: 'rune-orderbook' });
@@ -22,8 +22,8 @@ export default function App() {
       <div className="hero-ledger" aria-label="Protocol properties"><span>01</span><b>Price before time</b><p>Best price fills first. Equal prices keep their queue order.</p>
         <span>02</span><b>Funds before orders</b><p>Every resting order is fully backed by venue custody.</p>
         <span>03</span><b>Exit stays open</b><p>Cancel releases escrow immediately. Withdraw only what is free.</p></div></header>
-    <section id="markets" className="terminal-wrap"><div className="section-heading"><div><span className="eyebrow">Live instrument</span><h2>Rune / Relic</h2></div>
-      <p>The first listed pair proves the generic path. Markets, assets, ticks, lots and fees come from the venue registry—not this page.</p></div>
+    <section id="markets" className="terminal-wrap"><div className="section-heading"><div><span className="eyebrow">Live venue</span><h2>Open markets</h2></div>
+      <p>Pairs, assets, ticks, lots and fees come from the venue registry—not this page. This landing app renders whichever venue it is configured to use.</p></div>
       <OrderbookTerminal node={NODE} process={PROCESS} />
     </section>
     <section id="how" className="protocol"><div className="section-heading"><div><span className="eyebrow">One engine, explicit custody</span><h2>Nothing fills behind your back.</h2></div>
