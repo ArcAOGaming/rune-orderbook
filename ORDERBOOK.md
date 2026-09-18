@@ -1173,3 +1173,133 @@ fully occupied seven-market key is **121,454 bytes (118.6 KiB)**. Sparse books
 pay only for intervals that traded. That is material, but it is not duplicated
 inside the restore key; the requested 3-hour/24-hour chart windows are the one
 published copy.
+
+## 16. Built: the sharded venue — vaults, pairs, and one signature (2026-09-17)
+
+Status: **built and tested, not deployed.** `venue.lua` is untouched and still
+what is live. The new processes are `custody.lua` (shared), `pair.lua` and
+`vault.lua`; the suite is `contracts/sharded_test.lua`
+(`scripts/test-sharded.sh`, 63 checks on a live `~lua@5.3a`); the factory
+script is `backend/native/deploy-sharded-venue.mjs`.
+
+### Shape
+
+```
+            game                      TEST-RUNE   TEST-RELIC
+             |  Venue.Credit / Return      |  Credit-Notice / Transfer
+      +------+------+              +-------+-------+
+      |  game vault |              |  token vault  |    <- the ONLY difference
+      +------+------+              +-------+-------+
+             | Custody.Transfer            | Custody.Transfer
+   +---------+---------+-----+             |
+ air/gold fire/gold ... scroll/gold     rune/relic      <- one pair.lua each
+      \______ Custody.Transfer ______/
+         pairs move value directly
+```
+
+- **One market per pair process.** A slot on a pair pays only for its own book
+  (CLAUDE.md: every message pays for the whole published map), and a busy pair
+  no longer queues the others.
+- **A vault per side, and funding is the only difference.** It is read from the
+  signed definition (`Vault-Funding = token | game`) and cannot change. The game
+  vault speaks exactly the `Venue.Credit`/`Venue.Credited`/`Venue.Return`/
+  `Venue.Returned` protocol `venue.lua` does, so **`game.lua` does not change**:
+  point it with `Admin.SetVenueProcess`. The game hears only deposits and
+  withdrawals, never trading.
+- **The vault is the factory's registry.** `Admin.RegisterPair` admits a pair
+  and, in the same slot, sends every pair the full peer list (`Custody.Peers`).
+  Only then do pairs accept value from each other.
+- **A pair is configured by its definition** (`Pair-Vault`, `Pair-Base`,
+  `Pair-Quote`, `Pair-Id`, `Pair-Tick`, ...). There is no configure verb.
+  Names are prefixed because a definition is shared with HyperBEAM and the
+  spawner, which already use `name`, `type` and `device`.
+
+### One signature, many steps
+
+`Batch` takes up to 16 steps (`place`, `amend`, `cancel`, `cancelAll`, `move`,
+`withdraw`) as a JSON list and runs them **all-or-nothing in one slot**: on the
+first refusal the whole state table is put back and nothing is republished.
+Cancels are hoisted to the front, which is Hyperliquid's in-block ordering
+(non-order actions, then cancels, then orders) narrowed to one trader: a batch
+that closes and reopens cannot trade against its own stale order.
+
+A `move` step carries the rest of the intent with it (`then`). Cancel on
+fire/gold, move all Gold, buy on scroll/gold is **one signature and one hop**:
+
+| flow | hops | vs `venue.lua` |
+|---|---|---|
+| place / amend / cancel / batch on one pair | 0 | same |
+| move between pairs, with a follow-on order | 1 | new (one process before) |
+| game deposit / return | 1 | same |
+| token deposit straight onto a pair (`X-Pair`) | 1 after the token | +1 |
+| withdraw from a pair to a wallet | pair → vault → token, + Debit-Notice | +1 |
+
+The guarantee across processes is stated precisely: **value is exactly-once,
+the follow-on is best effort.** If the order that rode along cannot be placed
+when it lands, the value stays there as free balance and the landing reports
+`thenRefused`. Two-phase commit would cost more hops than it protects. A chain
+may cross at most 4 processes.
+
+### Links: exactly-once without acks or growing ledgers
+
+Every direction between two of our processes is a numbered link. The sender
+counts `seq` and cumulative `sent[asset]`; the receiver keeps a watermark
+(`mark`), the few numbers that arrived early (`ahead`, capped at 256) and
+cumulative `received[asset]`. A duplicate is recognised in O(1), the guard is
+O(links) rather than O(transfers ever), no acknowledgement is sent, and
+in-flight value is `sent - received`, read from published state (`pairlinks`,
+`vaultlinks`). Credits commute, so an early number is credited the moment it
+arrives. A transfer that never arrives is healed by re-pushing the sender's
+slot, never by refunding: a late delivery after a refund would pay twice.
+
+Reconciliation is all from published keys: `vaultsupply` asserts
+`backing == free + allocated` per asset, and `allocated` equals the pairs'
+`pairsupply` held + fees plus whatever the links show in flight.
+
+A transfer from a process the pair does not recognise (the race where a new
+pair's peer list has not landed yet) is **quarantined, neither credited nor
+refused**, capped at 64 rows, and released automatically when the next
+`Custody.Peers` names its sender.
+
+### Spawning: why the factory is still a script
+
+A HyperBEAM process cannot spawn one. `dev_push:augment_message` sets
+`type: Message` on every outbox entry it forwards, and the scheduler only
+initialises a process for `type: Process` (`dev_scheduler:post_local_schedule`).
+`ao.resolve` is callable from Lua, but a spawn from inside `compute` is a
+non-deterministic side effect that replay would repeat. So today the factory's
+hands are `deploy-sharded-venue.mjs` and its authority is the registry. Getting
+to no script needs a node change: let push forward a `type: Process` outbox
+entry signed by the node, and deliver a `Spawned` notice back to the spawning
+process. The vault's registration is already the one place that would accept
+that notice.
+
+### Deploy and clients
+
+`deploy-sharded-venue.mjs` spawns both sides on the graph's contract device
+(`lua@5.3b` today; under 5.3b the definition tags are also injected into the
+bootstrap `process`, which is the only definition a 5.3b contract sees),
+registers every pair, then LINKS: `Admin.SetVenueProcess` on the game and the
+UI graph's `internalVenue`/`externalVenue` point at the vaults. It refuses to
+link a side while the old venue it replaces still holds a balance, because the
+game accepts `Venue.Return` from one process only and the old balances would
+be stranded. Re-running retries only the link.
+
+The clients need nothing but the id. `packages/client/src/sharded.ts`
+recognises a vault by `vaultinfo` and presents the same reads and writes as a
+single venue: positions summed over the vault and every pair (order ids become
+`<pair>~<id>`), and a write whose funds are elsewhere becomes one signed batch
+that gathers them and runs the order where they land (`planRoute`).
+`VenueClient` and Rune Realm's `lib/venue.ts` shim both delegate to it.
+
+### Not done
+
+- Not deployed; the existing venues are still what is live.
+- Internal pairs are the four berries and scroll. Legendary Scroll and in-game
+  Rune (both listed on the old internal venue) are one line each in `SIDES`.
+- The batch rollback copies the whole pair state. Compute is cheap next to a
+  100 ms message, but it has not been measured against a full 2,000-order book.
+- Pair fees accrue in `fees` with no collection verb yet.
+- A JSON batch in an `Ops` tag has only been exercised through the in-VM
+  harness, not a real ANS-104 signer; the first live batch is the proof.
+- `cancelAll` across pairs is one signature per pair with open orders.

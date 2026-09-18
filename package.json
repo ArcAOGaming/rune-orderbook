@@ -6,6 +6,7 @@
   "workspaces": ["app", "packages/*"],
   "exports": {
     "./client": "./packages/client/src/index.ts",
+    "./sharded": "./packages/client/src/sharded.ts",
     "./ui": "./packages/ui/src/index.tsx",
     "./style.css": "./packages/ui/src/style.css"
   },
@@ -13,7 +14,8 @@
     "dev": "npm run dev -w @runerealm/orderbook-app",
     "build": "npm run typecheck -w @runerealm/orderbook-client && npm run typecheck -w @runerealm/orderbook-ui && npm run build -w @runerealm/orderbook-app",
     "test": "node --test test/*.test.mjs && npm run build",
-    "test:contract": "bash scripts/test-contract.sh"
+    "test:contract": "bash scripts/test-contract.sh",
+    "test:sharded": "bash scripts/test-sharded.sh"
   },
   "dependencies": {
     "@runerealm/ao": "https://github.com/ArcAOGaming/rune-ao/archive/ac71ed8fa2db8ce0ef42028d768bacbe656f7ab4.tar.gz"
