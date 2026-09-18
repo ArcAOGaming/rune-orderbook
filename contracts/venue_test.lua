@@ -130,12 +130,18 @@ local function run()
     VenueName = "TEST-Rune Realm Venue"
     GameProcess = ""
     Assets = {}
+    AssetCount = 0
     AssetByProcess = {}
     Ledger = {}
+    LedgerAccountCount = 0
     Book = nil
     Deposits = {}
     Withdrawals = {}
+    DepositCount = 0
+    WithdrawalCount = 0
     WithdrawSeq = 0
+    VenueRevision = 0
+    VenueCheckpointRevision = 0
     Emergency = { paused = false, reason = "", scope = "trading", at = 0 }
     Owner = nil
   end
@@ -211,30 +217,63 @@ local function run()
     Quantity = "1000" })
   ok("a credit with no reference is refused outright", errOf(r) ~= nil, json.encode(r))
 
-  r = deliver(GAME, { Action = "Venue.Credit", Account = ALICE, Asset = "gold",
+  local craw
+  r, craw = deliver(GAME, { Action = "Venue.Credit", Account = ALICE, Asset = "gold",
     Quantity = "1000", Reference = "d4" })
   ok("the game credits a player", r and r.deposit and r.deposit.status == "credited",
      json.encode(r and r.deposit))
   ok("and the balance is there", r and r.account and r.account.free
      and num(r.account.free.gold) == 1000, json.encode(r and r.account))
+  -- The acknowledgement the game's `VenueSends` row waits on. It must carry
+  -- the game's OWN reference, not the `<game>:d4` key this side stores, and in
+  -- the spellings `game.lua`'s `Venue.Credited` handler actually reads.
+  ok("a credit that lands is acknowledged back to the game",
+     sent(craw, "venue-credited").target == GAME
+     and sent(craw, "venue-credited").Action == "Venue.Credited",
+     json.encode(sent(craw, "venue-credited")))
+  ok("carrying the game's own reference, untouched",
+     sent(craw, "venue-credited").Reference == "d4"
+     and sent(craw, "venue-credited")["Deposit-Id"] == "d4",
+     json.encode(sent(craw, "venue-credited")))
 
   local _, raw = send(ALICE, { Action = "Balance" })
-  ok("a balance is published as an integer string, not a float",
-     string.find(raw["balance-" .. ALICE] or "", '"1000"', 1, true) ~= nil,
-     raw["balance-" .. ALICE])
+  if Lua53bPatchMode then
+    ok("a read-only balance emits results without republishing the account",
+       raw["balance-" .. ALICE] == nil, raw["balance-" .. ALICE])
+  else
+    ok("a balance is published as an integer string, not a float",
+       string.find(raw["balance-" .. ALICE] or "", '"1000"', 1, true) ~= nil,
+       raw["balance-" .. ALICE])
+  end
 
-  r = deliver(GAME, { Action = "Venue.Credit", Account = ALICE, Asset = "gold",
+  r, craw = deliver(GAME, { Action = "Venue.Credit", Account = ALICE, Asset = "gold",
     Quantity = "1000", Reference = "d4" })
   ok("the same reference delivered twice pays once",
      r and r.unchanged == true, json.encode(r))
+  ok("and is not acknowledged a second time",
+     next(sent(craw, "venue-credited")) == nil, json.encode(sent(craw, "venue-credited")))
   r = send(ALICE, { Action = "Balance" })
   ok("and the balance did not move", r and num(r.free.gold) == 1000, json.encode(r and r.free))
 
-  r = deliver(GAME, { Action = "Venue.Credit", Account = ALICE, Asset = "scroll",
+  r, craw = deliver(GAME, { Action = "Venue.Credit", Account = ALICE, Asset = "scroll",
     Quantity = "5", Reference = "d5" })
   ok("a credit in an unlisted asset is QUARANTINED, never refused",
      r and r.deposit and r.deposit.status == "unresolved", json.encode(r and r.deposit))
   ok("and it names why", r and r.deposit and r.deposit.reason ~= nil, json.encode(r and r.deposit))
+  ok("and a quarantined credit is NOT acknowledged -- nobody was credited",
+     next(sent(craw, "venue-credited")) == nil, json.encode(sent(craw, "venue-credited")))
+
+  r, craw = deliver(GAME, { Action = "Venue.Credit", Account = ALICE, Asset = "scroll",
+    Quantity = "5", Reference = "d5" })
+  ok("nor is a repeat of a quarantined credit",
+     r and r.unchanged == true and next(sent(craw, "venue-credited")) == nil,
+     json.encode(sent(craw, "venue-credited")))
+
+  r, craw = deliver(RUNE, { Action = "Venue.Credit", Account = ALICE, Asset = "gold",
+    Quantity = "1000", Reference = "d3b" })
+  ok("and a refused credit sends nothing anywhere",
+     errOf(r) == "Not authorised" and next(sent(craw, "venue-credited")) == nil,
+     json.encode(sent(craw, "venue-credited")))
 
   r = deliver(GAME, { Action = "Venue.Credit", Account = "nope", Asset = "gold",
     Quantity = "5", Reference = "d6" })
@@ -321,7 +360,10 @@ local function run()
   -- reconstructed before the next write.
   VenueMode, VenueSealed, VenueName, GameProcess = nil, false, "TEST-Rune Realm Venue", ""
   Assets, AssetByProcess, Ledger, Book = {}, {}, {}, nil
+  AssetCount, LedgerAccountCount = 0, 0
   Deposits, Withdrawals, WithdrawSeq = {}, {}, 0
+  DepositCount, WithdrawalCount = 0, 0
+  VenueRevision, VenueCheckpointRevision = 0, 0
   Emergency = { paused = false, reason = "", scope = "trading", at = 0 }
   restoreOperationalState(amendedState)
   ok("a cold venue restores custody, configuration and its resting book",
@@ -431,6 +473,38 @@ local function run()
   r = send(OWNER, { Action = "Admin.CreateMarket", Base = "gold", Quote = "fire_berry" })
   ok("but markets are still creatable after sealing -- that is the point",
      r and r.market ~= nil, json.encode(r))
+
+  -- A quarantined GAME credit resolved by hand ---------------------------------
+  --
+  -- The game's `VenueSends` row can only leave `pending` on `Venue.Credited`,
+  -- so an owner credit has to send the same acknowledgement the automatic
+  -- path would have.
+
+  local sraw
+  r, sraw = send(OWNER, { Action = "Admin.SettleDeposit", Reference = GAME .. ":d5",
+    Resolution = "writeoff" })
+  ok("a written-off game credit is not acknowledged as credited",
+     r and r.deposit and r.deposit.status == "written-off"
+     and next(sent(sraw, "venue-credited")) == nil,
+     json.encode(sent(sraw, "venue-credited")))
+
+  r, sraw = send(OWNER, { Action = "Admin.SettleDeposit", Reference = GAME .. ":d6",
+    Account = BOB })
+  ok("an owner-credited game credit is acknowledged back to the game",
+     r and r.deposit and r.deposit.status == "credited"
+     and sent(sraw, "venue-credited").target == GAME
+     and sent(sraw, "venue-credited").Action == "Venue.Credited",
+     json.encode(sent(sraw, "venue-credited")))
+  ok("with the game's own reference, not this side's key",
+     sent(sraw, "venue-credited").Reference == "d6"
+     and sent(sraw, "venue-credited")["Deposit-Id"] == "d6",
+     json.encode(sent(sraw, "venue-credited")))
+
+  r, sraw = send(OWNER, { Action = "Admin.SettleDeposit", Reference = GAME .. ":d6",
+    Account = BOB })
+  ok("and a repeat resolution acknowledges nothing",
+     r and r.unchanged == true and next(sent(sraw, "venue-credited")) == nil,
+     json.encode(r))
 
   -- Internal centiGold: game Gold stays whole, venue Gold gets two decimals --
 
@@ -545,10 +619,13 @@ local function run()
   ok("nor does one from a process this venue does not list",
      errOf(r) == "Not authorised", json.encode(r))
 
-  r = deliver(RUNE, { Action = "Credit-Notice", Sender = ALICE, Quantity = "50000000",
+  local nraw
+  r, nraw = deliver(RUNE, { Action = "Credit-Notice", Sender = ALICE, Quantity = "50000000",
     Reference = "t11" })
   ok("the listed token credits its sender",
      r and r.deposit and r.deposit.status == "credited", json.encode(r and r.deposit))
+  ok("and the external venue sends no game acknowledgement -- it has no game",
+     next(sent(nraw, "venue-credited")) == nil, json.encode(sent(nraw, "venue-credited")))
   ok("in the asset that token IS", r and r.deposit and r.deposit.asset == "rune",
      json.encode(r and r.deposit))
 
@@ -640,10 +717,13 @@ local function run()
   ok("a stranger cannot resolve a quarantined deposit",
      errOf(r) == "Not authorised", json.encode(r))
 
-  r = send(OWNER, { Action = "Admin.SettleDeposit", Reference = RUNE .. ":t50",
+  local qraw
+  r, qraw = send(OWNER, { Action = "Admin.SettleDeposit", Reference = RUNE .. ":t50",
     Account = ALICE })
   ok("the owner can", r and r.deposit and r.deposit.status == "credited",
      json.encode(r and r.deposit))
+  ok("and the external venue acknowledges nothing to a game it does not have",
+     next(sent(qraw, "venue-credited")) == nil, json.encode(sent(qraw, "venue-credited")))
 
   r = send(OWNER, { Action = "Admin.SettleDeposit", Reference = RUNE .. ":t50",
     Account = BOB })
@@ -895,8 +975,10 @@ local function run()
      answered and answered.account == STRANGER, json.encode(answered))
   ok("but publishes no key for it", balRaw["balance-" .. STRANGER] == nil,
      balRaw["balance-" .. STRANGER])
-  ok("while the signer's own key is still published",
-     balRaw["balance-" .. BOB] ~= nil, nil)
+  ok(Lua53bPatchMode and "and the read-only signer is not republished"
+       or "while the signer's own key is still published",
+     Lua53bPatchMode and balRaw["balance-" .. BOB] == nil
+       or balRaw["balance-" .. BOB] ~= nil, nil)
 
   -- Housekeeping that released nothing costs nothing --------------------------
   --
@@ -926,9 +1008,12 @@ local function run()
        and quietRaw.venuebookstate == nil and quietRaw.venuedepositstate == nil
        and quietRaw.venuewithdrawalstate == nil,
      tostring(quietRaw.venuebookstate))
-  ok("while the read path is published as always",
-     quietRaw.venuebook ~= nil and quietRaw.supply ~= nil
-       and quietRaw.venuecommit ~= nil, nil)
+  ok(Lua53bPatchMode and "and the 5.3b no-op republishes no read projection"
+       or "while the read path is published as always",
+     Lua53bPatchMode and quietRaw.venuebook == nil and quietRaw.supply == nil
+       and quietRaw.venuecommit == commitRes.venuecommit
+       or (not Lua53bPatchMode and quietRaw.venuebook ~= nil
+         and quietRaw.supply ~= nil and quietRaw.venuecommit ~= nil), nil)
 
   -- But one that DID release escrow must republish: the money moved.
   local shortLived = send(ALICE, { Action = "Order.Place", Side = "sell",
@@ -943,11 +1028,23 @@ local function run()
     { Action = "Order.Maintain" })
   ok("past its expiry the sweep releases it", reaped and num(reaped.expired) == 1,
      json.encode(reaped))
-  ok("and THAT one republishes every state key, because escrow moved",
-     reapedRaw.venueconfigstate ~= nil and reapedRaw.venueledgerstate ~= nil
-       and reapedRaw.venuebookstate ~= nil and reapedRaw.venuedepositstate ~= nil
-       and reapedRaw.venuewithdrawalstate ~= nil,
-     tostring(reapedRaw.venuebookstate))
+  if Lua53bPatchMode then
+    ok("and THAT one publishes only the changed pair, supply and account",
+       reapedRaw["book-rune-relic"] ~= nil
+         and reapedRaw["candles-rune-relic"] == nil
+         and reapedRaw["tape-rune-relic"] == nil
+         and reapedRaw.supply ~= nil and reapedRaw.venuecommit ~= nil
+         and reapedRaw["balance-" .. ALICE] ~= nil
+         and reapedRaw.venueledgerstate == nil
+         and reapedRaw.venuebookstate == nil,
+       json.encode(reapedRaw))
+  else
+    ok("and THAT one republishes every state key, because escrow moved",
+       reapedRaw.venueconfigstate ~= nil and reapedRaw.venueledgerstate ~= nil
+         and reapedRaw.venuebookstate ~= nil and reapedRaw.venuedepositstate ~= nil
+         and reapedRaw.venuewithdrawalstate ~= nil,
+       tostring(reapedRaw.venuebookstate))
+  end
 
   -- A market fee is bounded on BOTH sides --------------------------------------
 

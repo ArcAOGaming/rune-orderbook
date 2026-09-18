@@ -124,6 +124,7 @@ function M.custodyHost(opts)
       end
       return nil
     end,
+    orderChanged = opts.orderChanged,
   }
 end
 
@@ -929,7 +930,7 @@ end
 --- The public tape: recent trades with every private or derivable field gone.
 --- Rows are `[seconds, price, quantity, takerBought]`, grouped by market id.
 --- The cap is venue-wide, so adding markets never multiplies this key's size.
-local function tapeView(state, limit)
+local function tapeView(state, limit, markets)
   local out = {}
   local fills = type(state) == "table" and state.fills or {}
   local keep = math.max(1, int(limit, C.ECONOMY.orderbook.tapeLimit or 96))
@@ -938,14 +939,17 @@ local function tapeView(state, limit)
     local fill = fills[i]
     if type(fill) == "table" then
       local market = fill.market or (tostring(fill.item) .. "/gold")
-      local rows = out[market]
-      if not rows then rows = {}; out[market] = rows end
-      rows[#rows + 1] = {
-        int(fill.filledAt, 0) // 1000,
-        int(fill.price, 0),
-        int(fill.quantity, 0),
-        takerSideOf(fill) == "buy" and 1 or 0,
-      }
+      if markets == nil or markets == market
+         or (type(markets) == "table" and markets[market]) then
+        local rows = out[market]
+        if not rows then rows = {}; out[market] = rows end
+        rows[#rows + 1] = {
+          int(fill.filledAt, 0) // 1000,
+          int(fill.price, 0),
+          int(fill.quantity, 0),
+          takerSideOf(fill) == "buy" and 1 or 0,
+        }
+      end
     end
   end
   return out
@@ -964,6 +968,9 @@ end
 
 local function cancelOrder(host, state, ledger, order, timestamp, reason)
   if not order or not state.orders[order.id] then return end
+  if type(host.orderChanged) == "function" then
+    host.orderChanged(state, order, reason or "cancelled")
+  end
   local present = ledger.exists(order.account)
   local remaining = math.max(0, int(order.remaining, 0))
   if order.side == "sell" then
@@ -1323,6 +1330,11 @@ end
 --- becomes two candle rows and the UI reports two partial trade totals.
 local function normaliseMarketDaily(state)
   local source = type(state.marketDaily) == "table" and state.marketDaily or {}
+  -- `ensureState` is reached many times inside one action. Rebuilding even an
+  -- already-normalized empty map on every call created a fresh garbage table
+  -- each time. A decoded/imported map has a different identity and therefore
+  -- still takes the full repair exactly once.
+  if state.marketDailyNormalized == true then return state end
   local normalized = {}
   local function fold(wantString)
     for rawDay, row in pairs(source) do
@@ -1368,6 +1380,7 @@ local function normaliseMarketDaily(state)
     end
   end
   state.marketDaily = normalized
+  state.marketDailyNormalized = true
   return state
 end
 

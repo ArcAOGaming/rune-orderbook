@@ -74,6 +74,7 @@ GameProcess = GameProcess or ""
 --- `LXgcav_.../yoNoxm_...` is unreadable, and the whole registry exists so a
 --- pair can be named once and referred to by name afterwards.
 Assets = Assets or {}
+AssetCount = AssetCount or 0
 
 --- process id -> assetId, for `Credit-Notice` routing. EXTERNAL ONLY.
 --- Derived from `Assets`; kept as its own map because a notice arrives naming
@@ -90,6 +91,7 @@ AssetByProcess = AssetByProcess or {}
 --- kept a row per wallet it had ever seen would make every future message
 --- slower for everyone. See the published-bytes rule in CLAUDE.md.
 Ledger = Ledger or {}
+LedgerAccountCount = LedgerAccountCount or 0
 
 --- The order book's own state. `orderbook.lua` owns every field in here.
 Book = Book or nil
@@ -112,7 +114,11 @@ Book = Book or nil
 --- on -- an unresolved deposit, a pending withdrawal -- are published in full.
 Deposits = Deposits or {}
 Withdrawals = Withdrawals or {}
+DepositCount = DepositCount or 0
+WithdrawalCount = WithdrawalCount or 0
 WithdrawSeq = WithdrawSeq or 0
+VenueRevision = VenueRevision or 0
+VenueCheckpointRevision = VenueCheckpointRevision or 0
 
 --- The emergency stop. `paths` names what is stopped, so the ordinary case --
 --- halt trading, let everyone leave -- does not require also freezing the
@@ -374,6 +380,44 @@ local TouchedAccounts = {}
 -- Maintain that did expire an order moved escrow and must republish.
 local StateIdle = false
 
+-- 5.3b publication dirtiness. Authoritative custody remains in the globals
+-- above; these flags only decide which public projections this slot encodes.
+local DirtyPairs = {}
+local DirtyInfo, DirtyAssets, DirtyMarkets = false, false, false
+local DirtySupply, DirtyConfig, DirtyState = false, false, false
+local ForceCheckpoint = false
+
+local function markState()
+  DirtyState = true
+end
+
+local function marketFor(value)
+  value = tostring(value or "")
+  if Book and Book.markets and Book.markets[value] then return value end
+  for id, market in pairs(Book and Book.markets or {}) do
+    if market.base == value then return id end
+  end
+  return nil
+end
+
+local function markPair(value, traded)
+  local id = marketFor(value)
+  if id then
+    local dirty = DirtyPairs[id]
+    if not dirty then dirty = {}; DirtyPairs[id] = dirty end
+    dirty.book = true
+    if traded then dirty.candles, dirty.tape = true, true end
+  end
+  markState()
+end
+
+local function resetDirty()
+  DirtyPairs = {}
+  DirtyInfo, DirtyAssets, DirtyMarkets = false, false, false
+  DirtySupply, DirtyConfig, DirtyState = false, false, false
+  ForceCheckpoint = false
+end
+
 --- Credit free balance. Never called on its own: value only ever enters this
 --- process through a deposit, and `deposit` moves the pool with it.
 local function creditFree(account, asset, amount)
@@ -381,10 +425,17 @@ local function creditFree(account, asset, amount)
   if amount == 0 then return end
   if validId(account) then TouchedAccounts[account] = true end
   local held = Ledger[account]
-  if not held then held = {}; Ledger[account] = held end
+  if not held then
+    held = {}
+    Ledger[account] = held
+    LedgerAccountCount = int(LedgerAccountCount, 0) + 1
+  end
   local next_ = int(held[asset], 0) + amount
   if next_ > 0 then held[asset] = next_ else held[asset] = nil end
-  if next(held) == nil then Ledger[account] = nil end
+  if next(held) == nil then
+    Ledger[account] = nil
+    LedgerAccountCount = math.max(0, int(LedgerAccountCount, 0) - 1)
+  end
 end
 
 local function debitFree(account, asset, amount)
@@ -447,6 +498,12 @@ local function host()
       --- could take an order it could never settle.
       tradable = function(_, asset) return Assets[asset] ~= nil end,
       pauseReason = function() return tradingStopped() end,
+      orderChanged = function(_, order)
+        if type(order) == "table" then
+          DirtySupply = true
+          markPair(order.market or order.item)
+        end
+      end,
       -- No `quote`, `settleHouse` or `anchors`: there is no NPC desk here and
       -- there is not going to be one. A process cannot send anything by
       -- itself, so a "process that quotes" is a process somebody has to push
@@ -569,7 +626,7 @@ local function bookExport()
   local dropped = {
     bookIndex = true, orderHistory = true, rejected = true,
     actionReceiptOrder = true, marketIntraday = true,
-    marketIntradayVersion = true,
+    marketIntradayVersion = true, marketDailyNormalized = true,
   }
   local out = {}
   for key, value in pairs(ensureBook()) do
@@ -577,6 +634,7 @@ local function bookExport()
   end
   out.receiptRows = OrderBook.exportReceiptRows(out.actionReceipts)
   out.actionReceipts = nil
+  out.revision = int(VenueRevision, 0)
   return out
 end
 
@@ -661,6 +719,24 @@ local function rebuildAssetIndex()
   end
 end
 
+--- Counters make the hot restore check O(1). Older snapshots can contain the
+--- resident tables without these counters, so pay one reconciliation scan
+--- only when a counter is absent and the corresponding table is non-empty.
+local function reconcileResidentCounts()
+  if int(AssetCount, 0) == 0 and next(Assets) ~= nil then
+    AssetCount = tableCount(Assets)
+  end
+  if int(LedgerAccountCount, 0) == 0 and next(Ledger) ~= nil then
+    LedgerAccountCount = tableCount(Ledger)
+  end
+  if int(DepositCount, 0) == 0 and next(Deposits) ~= nil then
+    DepositCount = tableCount(Deposits)
+  end
+  if int(WithdrawalCount, 0) == 0 and next(Withdrawals) ~= nil then
+    WithdrawalCount = tableCount(Withdrawals)
+  end
+end
+
 --- Rehydrate the internal flat candle arrays from their one published copy.
 --- The public key is grouped by market id; authoritative state is grouped by
 --- base asset because that is what the shared engine receives on a fill.
@@ -687,47 +763,80 @@ local function restoreIntraday(base, book)
 end
 
 local function restoreOperationalState(base)
+  reconcileResidentCounts()
   local meta = decodedTable(base and base.venuecommit)
-  if not meta then return end
+  if not meta then return true end
 
-  if VenueMode == nil or tableCount(Assets) < int(meta.assets, 0) then
-    local config = decodedTable(base.venueconfigstate)
-    if config then
-      VenueMode = config.mode
-      VenueSealed = config.sealed == true
-      VenueName = type(config.name) == "string" and config.name or VenueName
-      GameProcess = type(config.gameProcess) == "string" and config.gameProcess or ""
-      Assets = narrowNumbers(type(config.assets) == "table" and config.assets or {})
-      Emergency = narrowNumbers(type(config.emergency) == "table" and config.emergency
-        or { paused = false, reason = "", scope = "trading", at = 0 })
-      rebuildAssetIndex()
-    end
+  local needsRestore = VenueMode == nil
+    or int(AssetCount, 0) < int(meta.assets, 0)
+    or int(LedgerAccountCount, 0) < int(meta.accounts, 0)
+    or type(Book) ~= "table"
+    or int(Book.orderSeq, 0) < int(meta.orderSeq, 0)
+    or int(Book.fillSeq, 0) < int(meta.fillSeq, 0)
+    or int(DepositCount, 0) < int(meta.deposits, 0)
+    or int(WithdrawalCount, 0) < int(meta.withdrawals, 0)
+  local publishedRevision = int(meta.revision, 0)
+  local checkpointRevision = int(base and base.venuecheckpointrevision,
+    int(meta.checkpointRevision, 0))
+  if needsRestore and checkpointRevision < publishedRevision then
+    return nil, "Venue checkpoint is stale: revision " .. asString(checkpointRevision)
+      .. " is behind " .. asString(publishedRevision)
   end
-  if tableCount(Ledger) < int(meta.accounts, 0) then
+
+  if VenueMode == nil or int(AssetCount, 0) < int(meta.assets, 0) then
+    local config = decodedTable(base.venueconfigstate)
+    if not config then return nil, "Venue config checkpoint is missing" end
+    VenueMode = config.mode
+    VenueSealed = config.sealed == true
+    VenueName = type(config.name) == "string" and config.name or VenueName
+    GameProcess = type(config.gameProcess) == "string" and config.gameProcess or ""
+    Assets = narrowNumbers(type(config.assets) == "table" and config.assets or {})
+    AssetCount = tableCount(Assets)
+    Emergency = narrowNumbers(type(config.emergency) == "table" and config.emergency
+      or { paused = false, reason = "", scope = "trading", at = 0 })
+    rebuildAssetIndex()
+  end
+  if int(LedgerAccountCount, 0) < int(meta.accounts, 0) then
     local restored = decodedTable(base.venueledgerstate)
-    if restored then Ledger = narrowNumbers(restored) end
+    if not restored then return nil, "Venue ledger checkpoint is missing" end
+    Ledger = narrowNumbers(restored)
+    LedgerAccountCount = tableCount(Ledger)
   end
   if type(Book) ~= "table" or int(Book.orderSeq, 0) < int(meta.orderSeq, 0)
-     or int(Book.fillSeq, 0) < int(meta.fillSeq, 0) then
+    or int(Book.fillSeq, 0) < int(meta.fillSeq, 0) then
     local restored = decodedTable(base.venuebookstate)
-    if restored then
-      Book = OrderBook.restoreReceiptRows(narrowNumbers(restored))
-      OrderBook.normaliseMarketDaily(Book)
-      restoreIntraday(base, Book)
-      OrderBook.normaliseMarketIntraday(Book)
-      ensureBook()
-      rebuildReceiptOrder(Book)
+    if not restored then return nil, "Venue book checkpoint is missing" end
+    if int(restored.revision, checkpointRevision) < publishedRevision then
+      return nil, "Venue book checkpoint is stale"
     end
+    Book = OrderBook.restoreReceiptRows(narrowNumbers(restored))
+    Book.revision = nil
+    OrderBook.normaliseMarketDaily(Book)
+    restoreIntraday(base, Book)
+    OrderBook.normaliseMarketIntraday(Book)
+    ensureBook()
+    rebuildReceiptOrder(Book)
   end
-  if tableCount(Deposits) < int(meta.deposits, 0) then
+  if int(DepositCount, 0) < int(meta.deposits, 0) then
     local restored = decodedTable(base.venuedepositstate)
-    if restored then Deposits = rekey(narrowNumbers(restored)) end
+    if not restored then return nil, "Venue deposit checkpoint is missing" end
+    Deposits = rekey(narrowNumbers(restored))
+    DepositCount = tableCount(Deposits)
   end
-  if tableCount(Withdrawals) < int(meta.withdrawals, 0) then
+  if int(WithdrawalCount, 0) < int(meta.withdrawals, 0) then
     local restored = decodedTable(base.venuewithdrawalstate)
-    if restored then Withdrawals = rekey(narrowNumbers(restored)) end
+    if not restored then return nil, "Venue withdrawal checkpoint is missing" end
+    Withdrawals = rekey(narrowNumbers(restored))
+    WithdrawalCount = tableCount(Withdrawals)
   end
   WithdrawSeq = math.max(int(WithdrawSeq, 0), int(meta.withdrawSeq, 0))
+  AssetCount = math.max(int(AssetCount, 0), int(meta.assets, 0))
+  LedgerAccountCount = math.max(int(LedgerAccountCount, 0), int(meta.accounts, 0))
+  DepositCount = math.max(int(DepositCount, 0), int(meta.deposits, 0))
+  WithdrawalCount = math.max(int(WithdrawalCount, 0), int(meta.withdrawals, 0))
+  VenueRevision = math.max(int(VenueRevision, 0), publishedRevision)
+  VenueCheckpointRevision = math.max(int(VenueCheckpointRevision, 0), checkpointRevision)
+  return true
 end
 
 -- Views ------------------------------------------------------------------------
@@ -827,6 +936,49 @@ local function candleView(timestamp)
   return markets
 end
 
+-- One market's projections. Pair ids contain `/`, which is a patch-path
+-- separator, so the index publishes a stable dash-safe key for clients.
+local function pairSuffix(id)
+  return string.gsub(tostring(id or ""), "[^a-z0-9_]", "-")
+end
+
+local function pairKeys(id)
+  local suffix = pairSuffix(id)
+  return {
+    book = "book-" .. suffix,
+    candles = "candles-" .. suffix,
+    tape = "tape-" .. suffix,
+  }
+end
+
+local function pairIndexView()
+  local out = {}
+  for id, market in pairs(Book.markets) do
+    local keys = pairKeys(id)
+    out[id] = { id = id, base = market.base, quote = market.quote,
+      book = keys.book, candles = keys.candles, tape = keys.tape }
+  end
+  return out
+end
+
+local function pairBookView(id, timestamp)
+  local market = Book.markets[id]
+  if not market then return nil end
+  local levels = OrderBook.p2pLadder(Book, timestamp, market.base)
+  return {
+    id = id, base = market.base, quote = market.quote, status = market.status,
+    tick = int(market.tick, 1), lot = int(market.lot, 1),
+    bestBid = levels.bestBid, bestAsk = levels.bestAsk,
+    depth = { bids = levels.bids, asks = levels.asks },
+    band = OrderBook.bandView(host(), Book, market.base, timestamp),
+  }
+end
+
+local function pairCandleView(id, timestamp)
+  local market = Book.markets[id]
+  return market and OrderBook.intradayView(Book, timestamp, market.base) or nil
+end
+
 local function infoView()
   return {
     Name = VenueName,
@@ -908,14 +1060,22 @@ H["Order.Place"] = function(base, msg, timestamp, b)
       expiresIn = tag(msg, "ExpiresIn"),
     })
   if not placed then return fail(base, problem) end
+  if placed.replayed ~= true then
+    DirtySupply = true
+    markPair((placed.order and placed.order.market)
+      or tag(msg, "Market", "Item", "Base"), #(placed.fills or {}) > 0)
+  end
   return reply(base, { order = placed, account = accountView(who, timestamp) })
 end
 
 H["Order.Amend"] = function(base, msg, timestamp, b)
   local who, refusal = trader(base, msg, b)
   if not who then return refusal end
+  local orderId = tostring(tag(msg, "OrderId", "Order") or "")
+  local prior = Book.orders[orderId]
+  local priorMarket = prior and (prior.market or prior.item) or nil
   local amended, problem = OrderBook.amendOrder(host(), Book, who,
-    tostring(tag(msg, "OrderId", "Order") or ""),
+    orderId,
     -- An omitted field means "keep the resting value".  Passing zero for a
     -- missing Price made every quantity-only amend fail as Invalid unit price;
     -- the in-game book already preserves nil in exactly this way.
@@ -926,15 +1086,27 @@ H["Order.Amend"] = function(base, msg, timestamp, b)
       stp = tag(msg, "Stp", "SelfTrade"),
     })
   if not amended then return fail(base, problem) end
+  if amended.replayed ~= true then
+    DirtySupply = true
+    markPair((amended.order and amended.order.market) or priorMarket,
+      #(amended.fills or {}) > 0)
+  end
   return reply(base, { order = amended, account = accountView(who, timestamp) })
 end
 
 H["Order.Cancel"] = function(base, msg, timestamp, b)
   local who, refusal = trader(base, msg, b)
   if not who then return refusal end
+  local orderId = tostring(tag(msg, "OrderId", "Order") or "")
+  local prior = Book.orders[orderId]
+  local priorMarket = prior and (prior.market or prior.item) or nil
   local cancelled, problem = OrderBook.cancelOrder(host(), Book, who,
-    tostring(tag(msg, "OrderId", "Order") or ""), timestamp, tag(msg, "ActionId"))
+    orderId, timestamp, tag(msg, "ActionId"))
   if not cancelled then return fail(base, problem) end
+  if cancelled.replayed ~= true then
+    DirtySupply = true
+    markPair(priorMarket)
+  end
   return reply(base, { cancelled = cancelled, account = accountView(who, timestamp) })
 end
 
@@ -944,6 +1116,13 @@ H["Order.CancelAll"] = function(base, msg, timestamp, b)
   local cancelled, problem = OrderBook.cancelOrders(host(), Book, who,
     { item = tag(msg, "Item", "Base", "Market") }, timestamp, tag(msg, "ActionId"))
   if not cancelled then return fail(base, problem) end
+  if cancelled.replayed ~= true then
+    DirtySupply = true
+    markPair(tag(msg, "Market", "Item", "Base"))
+    -- A whole-account cancel can span pairs; the orderbook callback marks each
+    -- order it actually closed.
+    markState()
+  end
   return reply(base, { cancelled = cancelled, account = accountView(who, timestamp) })
 end
 
@@ -965,6 +1144,7 @@ end
 H["Order.Maintain"] = function(base, msg, timestamp)
   local expired = OrderBook.maintain(host(), Book, timestamp, int(tag(msg, "Limit"), 25))
   StateIdle = int(expired, 0) == 0
+  if not StateIdle then markState() end
   return reply(base, { expired = expired })
 end
 
@@ -985,6 +1165,7 @@ end
 local function settleDeposit(base, reference, account, asset, amount, timestamp, backingAmount)
   local seen = Deposits[reference]
   if seen then return reply(base, { deposit = seen, unchanged = true }) end
+  DepositCount = int(DepositCount, 0) + 1
 
   local function quarantine(why)
     Deposits[reference] = {
@@ -993,6 +1174,7 @@ local function settleDeposit(base, reference, account, asset, amount, timestamp,
       backingAmount = backingAmount ~= nil and asString(backingAmount) or nil,
       noticedAt = timestamp,
     }
+    markState()
     return reply(base, { deposit = Deposits[reference] })
   end
 
@@ -1008,6 +1190,8 @@ local function settleDeposit(base, reference, account, asset, amount, timestamp,
     amount = asString(amount), status = "credited", creditedAt = timestamp,
     backingAmount = backingAmount ~= nil and asString(backingAmount) or nil,
   }
+  DirtySupply = true
+  markState()
   return reply(base, {
     deposit = Deposits[reference], account = accountView(account, timestamp),
   })
@@ -1049,6 +1233,25 @@ end
 --- There is no token here and there is not going to be one. `fire_berry` is a
 --- name; what makes this credit real is that exactly one process is allowed to
 --- say it, and that process debited the player before it did.
+---
+--- A credit that LANDS is acknowledged with `Venue.Credited`, the mirror of the
+--- game's `Venue.Returned`, so the game's `VenueSends` row leaves `pending` and
+--- its bound can reach it. It carries the game's reference back untouched --
+--- `v<n>`, not the `<game>:v<n>` key this side stores it under -- because that
+--- is the id the game's row is keyed by. One extra hop per send; see
+--- PROCESS_SHAPE_AUDIT.md.
+---
+--- Acknowledged ONLY in the message that moved the balance:
+---
+---   * a QUARANTINED credit is not acknowledged. Nobody was credited, and the
+---     game's `pending` row is the visible half of that on its side -- exactly
+---     as the game does not answer a quarantined `Venue.Return`.
+---   * a REPEAT is not acknowledged. The acknowledgement is part of the
+---     outbox of the slot that credited, so a lost one is healed by pushing
+---     that slot again, not by a duplicate delivery minting a second message
+---     (and a repeat may name a quarantined row, which must not settle over
+---     there). The game's handler is idempotent either way -- a second
+---     `Venue.Credited` answers `unchanged` and moves nothing.
 H["Venue.Credit"] = function(base, msg, timestamp, b)
   local refusal = requireMode(base, "internal")
   if refusal then return refusal end
@@ -1063,8 +1266,20 @@ H["Venue.Credit"] = function(base, msg, timestamp, b)
   local asset = tostring(tag(msg, "Asset", "Item") or "")
   local backingAmount = int(tag(msg, "Quantity"), 0)
   local amount = math.tointeger(backingAmount * assetScale(asset)) or 0
-  return settleDeposit(base, from .. ":" .. reference,
+  local key = from .. ":" .. reference
+  local repeated = Deposits[key] ~= nil
+  local result = settleDeposit(base, key,
     tag(msg, "Account", "PlayerId"), asset, amount, timestamp, backingAmount)
+  local row = Deposits[key]
+  if not repeated and type(row) == "table" and row.status == "credited" then
+    result.results.outbox = {
+      ["venue-credited"] = {
+        target = GameProcess, Action = "Venue.Credited",
+        Reference = reference, ["Deposit-Id"] = reference,
+      },
+    }
+  end
+  return result
 end
 
 -- Withdrawals ------------------------------------------------------------------
@@ -1114,6 +1329,9 @@ H["Withdraw"] = function(base, msg, timestamp, b)
     backingAmount = asString(backingAmount),
     status = "pending", requestedAt = timestamp, settledAt = 0,
   }
+  WithdrawalCount = int(WithdrawalCount, 0) + 1
+  DirtySupply = true
+  markState()
 
   -- Where it goes is the ONE thing the two venues do not share.
   local out
@@ -1156,6 +1374,7 @@ local function settleWithdrawal(base, from, id, timestamp)
   end
   w.status = "settled"
   w.settledAt = timestamp
+  markState()
   return reply(base, { withdrawal = w })
 end
 
@@ -1197,6 +1416,8 @@ H["Admin.Configure"] = function(base, msg, _, b)
   if type(name) == "string" and name ~= "" then VenueName = name end
   local game = tag(msg, "GameProcess", "Game")
   if validId(game) then GameProcess = game end
+  DirtyInfo, DirtyConfig = true, true
+  markState()
 
   if VenueMode == "internal" and GameProcess == "" then
     return reply(base, { info = infoView(),
@@ -1219,6 +1440,7 @@ H["Admin.ListAsset"] = function(base, msg, _, b)
     return fail(base, "An asset id is 1-32 characters of a-z, 0-9 and _")
   end
   local name = tostring(tag(msg, "Name") or id)
+  local isNew = Assets[id] == nil
   local denomination = int(tag(msg, "Denomination"), 0)
   local maximumDenomination = VenueMode == "external" and 18 or 12
   if denomination < 0 or denomination > maximumDenomination then
@@ -1243,7 +1465,10 @@ H["Admin.ListAsset"] = function(base, msg, _, b)
   else
     Assets[id] = { id = id, name = name, kind = "game", denomination = denomination }
   end
+  if isNew then AssetCount = int(AssetCount, 0) + 1 end
   pool(id)
+  DirtyInfo, DirtyAssets, DirtyConfig, DirtySupply = true, true, true, true
+  markState()
   return reply(base, { asset = assetView()[id] })
 end
 
@@ -1310,6 +1535,8 @@ H["Admin.CreateMarket"] = function(base, msg, _, b)
   -- venue has no desk to quote with. Clear it rather than leave a flag on that
   -- means "ask a house that does not exist".
   Book.markets[id].houseQuotes = false
+  DirtyInfo, DirtyMarkets = true, true
+  markState()
   return reply(base, { market = marketView()[id] })
 end
 
@@ -1317,6 +1544,8 @@ local function setMarketStatus(base, id, status)
   local market = Book.markets[id]
   if not market then return fail(base, "No such market") end
   market.status = status
+  DirtyInfo, DirtyMarkets = true, true
+  markState()
   return reply(base, { market = marketView()[id] })
 end
 
@@ -1349,9 +1578,11 @@ H["Admin.LaunchAll"] = function(base, msg, _, b)
     if market.status ~= "open" then
       market.status = "open"
       opened[#opened + 1] = id
+      markState()
     end
   end
   table.sort(opened)
+  if #opened > 0 then DirtyInfo, DirtyMarkets = true, true end
   return reply(base, { opened = opened, markets = marketView() })
 end
 
@@ -1364,6 +1595,8 @@ H["Admin.Seal"] = function(base, msg, _, b)
     return fail(base, "The internal venue has no game process")
   end
   VenueSealed = true
+  DirtyInfo, DirtyConfig = true, true
+  markState()
   return reply(base, { info = infoView() })
 end
 
@@ -1390,6 +1623,8 @@ H["Admin.Pause"] = function(base, msg, timestamp, b)
     scope = scope,
     at = timestamp,
   }
+  DirtyInfo, DirtyConfig = true, true
+  markState()
   return reply(base, { emergency = Emergency })
 end
 
@@ -1397,7 +1632,18 @@ H["Admin.Resume"] = function(base, msg, timestamp, b)
   local refusal = requireOwner(base, msg, b)
   if refusal then return refusal end
   Emergency = { paused = false, reason = "", scope = "trading", at = timestamp }
+  DirtyInfo, DirtyConfig = true, true
+  markState()
   return reply(base, { emergency = Emergency })
+end
+
+--- Publish one complete restore checkpoint on demand. Ordinary 5.3b writes
+--- keep globals authoritative and advance only the compact revision witness.
+H["Admin.Checkpoint"] = function(base, msg, _, b)
+  local refusal = requireOwner(base, msg, b)
+  if refusal then return refusal end
+  ForceCheckpoint = true
+  return reply(base, { revision = asString(VenueRevision), checkpoint = true })
 end
 
 --- Resolve a quarantined deposit by hand: credit it, or write it off.
@@ -1418,6 +1664,7 @@ H["Admin.SettleDeposit"] = function(base, msg, timestamp, b)
     row.status = "written-off"
     row.reason = tostring(tag(msg, "Reason") or row.reason)
     row.creditedAt = timestamp
+    markState()
     return reply(base, { deposit = row })
   end
 
@@ -1436,7 +1683,25 @@ H["Admin.SettleDeposit"] = function(base, msg, timestamp, b)
   row.asset = asset
   row.amount = asString(amount)
   row.creditedAt = timestamp
-  return reply(base, { deposit = row, account = accountView(account, timestamp) })
+  DirtySupply = true
+  markState()
+  local result = reply(base, { deposit = row, account = accountView(account, timestamp) })
+  -- A game credit resolved by hand has now LANDED, so it is acknowledged the
+  -- way `Venue.Credit` acknowledges one: nothing else can take the game's
+  -- `VenueSends` row out of `pending`. A write-off is not -- the game's handler
+  -- would record it as credited.
+  local prefix = GameProcess .. ":"
+  if VenueMode == "internal" and GameProcess ~= ""
+     and reference:sub(1, #prefix) == prefix then
+    local gameReference = reference:sub(#prefix + 1)
+    result.results.outbox = {
+      ["venue-credited"] = {
+        target = GameProcess, Action = "Venue.Credited",
+        Reference = gameReference, ["Deposit-Id"] = gameReference,
+      },
+    }
+  end
+  return result
 end
 
 --- A withdrawal whose confirmation never came. Either mark it settled because
@@ -1461,10 +1726,12 @@ H["Admin.SettleWithdrawal"] = function(base, msg, timestamp, b)
     local held = pool(w.asset)
     held.player = int(held.player, 0) + int(w.amount, 0)
     w.status = "refunded"
+    DirtySupply = true
   else
     w.status = "settled"
   end
   w.settledAt = timestamp
+  markState()
   return reply(base, { withdrawal = w })
 end
 
@@ -1515,7 +1782,7 @@ end
 
 function compute(base, req)
   base = type(base) == "table" and base or {}
-  restoreOperationalState(base)
+  local restored, restoreProblem = restoreOperationalState(base)
   local msg = (req and req.body) or {}
   -- THE ASSIGNMENT FIRST, THE BODY ONLY AS A LAST RESORT, AND THE ORDER IS THE
   -- WHOLE POINT. `msg` is `req.body` -- the user's own signed data item -- so
@@ -1532,15 +1799,20 @@ function compute(base, req)
 
   TouchedAccounts = {}
   StateIdle = false
-  ensureBook()
-  Emergency = type(Emergency) == "table" and Emergency
-    or { paused = false, reason = "", scope = "trading", at = 0 }
+  resetDirty()
+  if restored then
+    ensureBook()
+    Emergency = type(Emergency) == "table" and Emergency
+      or { paused = false, reason = "", scope = "trading", at = 0 }
+  end
   resolveOwner(base)
 
   local action = tag(msg, "Action") or "none"
-  local handler = resolveHandler(action)
+  local handler = restored and resolveHandler(action) or nil
   local result
-  if not handler then
+  if restoreProblem then
+    result = fail(base, restoreProblem)
+  elseif not handler then
     local names = {}
     for name in pairs(H) do names[#names + 1] = name end
     table.sort(names)
@@ -1549,6 +1821,12 @@ function compute(base, req)
   else
     local ok, out = pcall(function() return handler(base, msg, timestamp, base) end)
     result = ok and out or fail(base, tostring(out))
+  end
+
+  local patchMode = Lua53bPatchMode == true
+  local initial = base.venuecommit == nil
+  if DirtyState and not StateIdle then
+    VenueRevision = int(VenueRevision, 0) + 1
   end
 
   -- Published state: the read path.
@@ -1562,33 +1840,86 @@ function compute(base, req)
   -- are all here, so a client has no reason to read either, and a book that
   -- publishes every resting order pays for all of them on every message --
   -- five times over, whatever the message was.
-  result.venueinfo = encode(infoView())
-  result.assets = encode(assetView())
-  result.markets = encode(marketView())
-  result.venuebook = encode(bookView(timestamp))
-  result.venuecandles = encode(candleView(timestamp))
-  result.venuetape = encode(OrderBook.tapeView(Book))
-  result.supply = encode(supplyView())
-  result.paused = Emergency.paused and "1" or "0"
-
   local readOnly = { info = true, balance = true, book = true, supply = true }
-  if result.venuecommit == nil
-     or (handler and not readOnly[word(action)] and not StateIdle) then
+  local legacyWrite = handler and not readOnly[word(action)] and not StateIdle
+  local checkpoint = initial
+    or (patchMode and (ForceCheckpoint
+      or (DirtyState and VenueRevision % 50 == 0)))
+    or (not patchMode and legacyWrite)
+
+  if restored and not patchMode then
+    result.venueinfo = encode(infoView())
+    result.assets = encode(assetView())
+    result.markets = encode(marketView())
+    result.venuebook = encode(bookView(timestamp))
+    result.venuecandles = encode(candleView(timestamp))
+    result.venuetape = encode(OrderBook.tapeView(Book))
+    result.supply = encode(supplyView())
+    result.paused = Emergency.paused and "1" or "0"
+  elseif restored then
+    if initial or DirtyInfo then
+      result.venueinfo = encode(infoView())
+      result.paused = Emergency.paused and "1" or "0"
+    end
+    if initial or DirtyAssets then result.assets = encode(assetView()) end
+    if initial or DirtyMarkets then
+      result.markets = encode(marketView())
+      result.venuepairs = encode(pairIndexView())
+    end
+    if initial or DirtySupply then result.supply = encode(supplyView()) end
+
+    -- Legacy aggregate views are born once for old readers. Live updates are
+    -- pair-addressed, so one market never serialises every unrelated market.
+    if initial then
+      result.venuebook = encode(bookView(timestamp))
+      result.venuecandles = encode(candleView(timestamp))
+      result.venuetape = encode(OrderBook.tapeView(Book))
+      result.venuepairs = encode(pairIndexView())
+      for id in pairs(Book.markets) do
+        DirtyPairs[id] = { book = true, candles = true, tape = true }
+      end
+    end
+    local tape = nil
+    for id, dirty in pairs(DirtyPairs) do
+      local keys = pairKeys(id)
+      if dirty.book then result[keys.book] = encode(pairBookView(id, timestamp)) end
+      if dirty.candles then
+        result[keys.candles] = encode(pairCandleView(id, timestamp))
+      end
+      if dirty.tape then
+        tape = tape or OrderBook.tapeView(Book, nil, DirtyPairs)
+        result[keys.tape] = encode(tape[id] or {})
+      end
+    end
+  end
+
+  if restored and (checkpoint or DirtyConfig) then
     result.venueconfigstate = encode({
       mode = VenueMode, sealed = VenueSealed == true, name = VenueName,
       gameProcess = GameProcess, assets = Assets, emergency = Emergency,
     })
+  end
+  if restored and checkpoint then
+    VenueCheckpointRevision = int(VenueRevision, 0)
     result.venueledgerstate = encode(Ledger)
     result.venuebookstate = encode(bookExport())
     result.venuedepositstate = encode(depositExport())
     result.venuewithdrawalstate = encode(withdrawalExport())
+    -- Intraday bars are restore material. The aggregate is refreshed only at
+    -- a checkpoint; ordinary trading updates the changed pair key above.
+    result.venuecandles = encode(candleView(timestamp))
+    result.venuecheckpointrevision = asString(VenueCheckpointRevision)
   end
-  result.venuecommit = encode({
-    assets = tableCount(Assets), accounts = tableCount(Ledger),
-    deposits = tableCount(Deposits), withdrawals = tableCount(Withdrawals),
-    withdrawSeq = int(WithdrawSeq, 0),
-    orderSeq = int(Book and Book.orderSeq, 0), fillSeq = int(Book and Book.fillSeq, 0),
-  })
+  if restored and (not patchMode or initial or DirtyState or ForceCheckpoint) then
+    result.venuecommit = encode({
+      assets = int(AssetCount, 0), accounts = int(LedgerAccountCount, 0),
+      deposits = int(DepositCount, 0), withdrawals = int(WithdrawalCount, 0),
+      withdrawSeq = int(WithdrawSeq, 0),
+      orderSeq = int(Book and Book.orderSeq, 0), fillSeq = int(Book and Book.fillSeq, 0),
+      revision = int(VenueRevision, 0),
+      checkpointRevision = int(VenueCheckpointRevision, 0),
+    })
+  end
 
   -- One trader's complete bounded position, addressable without pulling the
   -- whole ledger: `/now/balance-<address>`. It includes free balances plus the
@@ -1596,7 +1927,8 @@ function compute(base, req)
   -- every order id and left no unsigned way to cancel it. An emptied account
   -- remains a small object rather than disappearing because a published key,
   -- once created, stays in the process map.
-  for address in pairs(touched(msg, {})) do
+  local publishAccounts = patchMode and TouchedAccounts or touched(msg, {})
+  for address in pairs(publishAccounts) do
     result["balance-" .. address] = encode(accountView(address, timestamp))
   end
 
