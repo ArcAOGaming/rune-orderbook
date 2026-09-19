@@ -262,10 +262,33 @@ export class ShardedVenue {
   tape<T>() { return this.perMarket<T>('pairtape'); }
   candles<T>() { return this.perMarket<T>('paircandles'); }
 
-  /** The raw fill ring each pair keeps for its own restore, for chart backfill. */
+  /**
+   * Each pair's fill ring, for chart backfill. A pair publishes it address-free
+   * as `pairhistory` rows `[seconds, price, quantity, takerBought]`; one
+   * deployed before that key existed is read from its `pairstate` checkpoint.
+   * Rows carry only what a chart uses: no id, fee or counterparties.
+   */
   async historyFills(): Promise<Fill[]> {
-    const states = await this.perMarket<{ book?: { fills?: Fill[] } }>('pairstate');
-    return Object.values(states).flatMap((state) => state?.book?.fills ?? []);
+    const out: Fill[] = [];
+    await Promise.all(Object.values(await this.pairs()).map(async (pair) => {
+      const rows = await this.readOr<unknown>(pair.process, 'pairhistory', null);
+      if (Array.isArray(rows)) {
+        const market = `${pair.base}/${pair.quote}`;
+        for (const row of rows) {
+          if (!Array.isArray(row)) continue;
+          const [at, price, quantity, bought] = row.map(Number);
+          out.push({
+            id: '', market, item: pair.base, price, quantity, fee: 0, buyer: '', seller: '',
+            takerSide: bought === 1 ? 'buy' : 'sell', filledAt: at * 1000,
+          });
+        }
+        return;
+      }
+      const state = await this.readOr<{ book?: { fills?: Fill[] } } | null>(
+        pair.process, 'pairstate', null);
+      out.push(...(state?.book?.fills ?? []));
+    }));
+    return out;
   }
 
   /** Per-asset custody summed over the vault and every pair. */

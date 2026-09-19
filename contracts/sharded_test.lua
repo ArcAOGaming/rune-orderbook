@@ -319,6 +319,13 @@ local function run()
     freeAt(PRQ, BOB, "rune") .. " " .. freeAt(PRQ, BOB, "quote"))
   ok("the maker is paid without sending anything", freeAt(PRQ, ALICE, "quote") == 200,
     freeAt(PRQ, ALICE, "quote"))
+  send(OWNER, PRQ, { Action = "Admin.Checkpoint" })
+  local history = published(PRQ, "pairhistory")
+  local rawHistory = net[PRQ].base.pairhistory or ""
+  ok("the fill ring is published address-free for chart backfill",
+    history and #history == 1 and num(history[1][2]) == 5 and num(history[1][3]) == 40
+      and num(history[1][4]) == 1 and not rawHistory:find(ALICE, 1, true)
+      and not rawHistory:find(BOB, 1, true), rawHistory)
 
   -- 5. All or nothing -------------------------------------------------------------
 

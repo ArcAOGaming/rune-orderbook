@@ -206,3 +206,18 @@ test('a failed vault check is retried, not remembered as "not a vault"', async (
   await assert.rejects(isVault(transport, pid), /timeout/);
   assert.equal(await isVault(transport, pid), true);
 });
+
+test('chart backfill reads pairhistory, and pairstate from a pair that predates it', async () => {
+  const { transport } = network({
+    ...published,
+    [FIRE]: { ...published[FIRE], pairhistory: [[1790000000, 500, 3, 1], [1790000005, 498, 2, 0]] },
+    [SCROLL]: { ...published[SCROLL], pairstate: { book: { fills: [
+      { id: 'F1', market: 'scroll/gold', price: 40, quantity: 1, takerSide: 'sell', filledAt: 1790000001000 },
+    ] } } },
+  });
+  const fills = await new ShardedVenue(transport, VAULT).historyFills();
+  const fire = fills.filter((fill) => fill.market === 'fire_berry/gold')
+    .map(({ price, quantity, takerSide, filledAt }) => [filledAt, price, quantity, takerSide]);
+  assert.deepEqual(fire, [[1790000000000, 500, 3, 'buy'], [1790000005000, 498, 2, 'sell']]);
+  assert.deepEqual(fills.filter((fill) => fill.market === 'scroll/gold').map((fill) => fill.id), ['F1']);
+});

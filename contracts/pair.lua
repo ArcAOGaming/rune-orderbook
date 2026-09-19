@@ -702,10 +702,22 @@ function PairCompute(base, req)
   if not restored then return result end
 
   local s = S()
-  if Dirty.state and not StateIdle then s.revision = int(s.revision, 0) + 1 end
+  local wrote = Dirty.state and not StateIdle
+  if wrote then s.revision = int(s.revision, 0) + 1 end
+  -- Under 5.3b the published map lives in the same VM as PairState, so a lost
+  -- VM loses both and nothing can ever restore from a periodic checkpoint: the
+  -- commit is always ahead of it and Custody.restore refuses. That periodic
+  -- encode was the whole book, every resting order and the 500-fill ring
+  -- (~450 KB, a second-long slot every 50 revisions). A 5.3b pair now writes
+  -- `pairstate` only when a checkpoint can be used -- at spawn and on
+  -- Admin.Checkpoint, the explicit export -- and the chart backfill that read
+  -- the fill ring out of it gets `pairhistory` instead.
   local patchMode = Lua53bPatchMode == true
-  local checkpoint = initial or ForceCheckpoint
-    or (Dirty.state and not StateIdle and (not patchMode or s.revision % 50 == 0))
+  local checkpoint = initial or ForceCheckpoint or (wrote and not patchMode)
+  -- `historyPending`: a trade since `pairhistory` was last written.
+  if Dirty.trade then s.historyPending = true end
+  local history = s.configured and (initial or ForceCheckpoint
+    or (s.historyPending and wrote and s.revision % 50 == 0))
 
   -- Published state. Never `info` (the device answers it); never the orders or
   -- fills in full (every message would pay for every resting order).
@@ -721,6 +733,13 @@ function PairCompute(base, req)
   if initial or Dirty.supply then result.pairsupply = encode(supplyView()) end
   if initial or Dirty.links then result.pairlinks = encode(Custody.linkView(s)) end
   if checkpoint then result.pairstate = encode(checkpointView()) end
+  -- The whole fill ring as address-free tape rows, `[seconds, price, quantity,
+  -- takerBought]`: what a chart needs and nothing a restore does.
+  if history then
+    result.pairhistory = encode(OrderBook.tapeView(s.book, math.max(1, #s.book.fills),
+      s.market)[s.market] or {})
+    s.historyPending = nil
+  end
   if initial or Dirty.state or ForceCheckpoint then
     result.paircommit = encode({ revision = s.revision })
   end

@@ -654,12 +654,23 @@ end
 --- price corridor never checked the SIGN of the age, so a fill stamped in the
 --- future anchors the band while it is excluded from the published median.
 --- Both spellings are preserved exactly as they were.
+---
+--- Keyed on an INTERVAL of time, not the instant. Every message carries a new
+--- timestamp, so keying on the instant rebuilt all five hundred fills on every
+--- message -- measured as the largest single cost of a pair's `Order.Place`.
+--- The rows only change when a fill crosses a window edge, so they are reused
+--- from `at` until the first such edge (`untilAt`, nil when there is none).
 local function fillDigest(state, timestamp)
   local index = bookIndex(state, timestamp)
   local now = int(timestamp, 0)
   local cached = index.fillDigest
-  if cached and cached.rev == int(index.fillsRev, 0) and cached.at == now then
+  if cached and cached.rev == int(index.fillsRev, 0) and now >= cached.at
+     and (cached.untilAt == nil or now < cached.untilAt) then
     return cached.rows
+  end
+  local untilAt = nil
+  local edge = function(at)
+    if at > now and (untilAt == nil or at < untilAt) then untilAt = at end
   end
   local rows = {}
   local rowFor = function(item)
@@ -673,8 +684,10 @@ local function fillDigest(state, timestamp)
   end
   for _, fill in ipairs(state.fills or {}) do
     local row = rowFor(fill.item)
-    local age = now - int(fill.filledAt, 0)
+    local filledAt = int(fill.filledAt, 0)
+    local age = now - filledAt
     local price = int(fill.price, 0)
+    edge(filledAt); edge(filledAt + DAY); edge(filledAt + 7 * DAY); edge(filledAt + 30 * DAY)
     if age < 7 * DAY then row.band7[#row.band7 + 1] = price end
     if age >= 0 and age < 30 * DAY then row.prices30[#row.prices30 + 1] = price end
     if age >= 0 and age < DAY then row.volume24 = row.volume24 + int(fill.quantity, 0) end
@@ -687,7 +700,7 @@ local function fillDigest(state, timestamp)
       row.makers[buyerTook and fill.seller or fill.buyer] = true
     end
   end
-  index.fillDigest = { rev = int(index.fillsRev, 0), at = now, rows = rows }
+  index.fillDigest = { rev = int(index.fillsRev, 0), at = now, untilAt = untilAt, rows = rows }
   return rows
 end
 
@@ -1757,7 +1770,10 @@ local function priceBand(host, state, market, item, timestamp)
   local bid, ask = hostAnchors(host, state, item)
   anchor(bid); anchor(ask)
   if not low then
-    anchor(median(copy((fillDigest(state, timestamp)[item] or EMPTY_DIGEST).band7)))
+    -- Memoised on the digest row, which lives exactly as long as its band7.
+    local row = fillDigest(state, timestamp)[item]
+    if row and row.band7Median == nil then row.band7Median = median(copy(row.band7)) or false end
+    anchor(row and row.band7Median or nil)
   end
   if not low then
     -- The book's own extremes. Each side's prices are already sorted, so the
